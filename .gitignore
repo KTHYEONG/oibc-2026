@@ -218,3 +218,26 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# IDE / Editor settings
+.idea/
+.vscode/
+
+# Data & DB & Model Artifacts
+*.xlsx
+*.csv
+*.db
+*.sqlite3
+catboost_info/
+*.cbm
+*.joblib
+/data/
+artifacts/models/
+legacy/
+.legacy/
+
+# AI Experimentation & Scratch directories
+scratch/
+docs/specs/
+tmp/
+.serena/

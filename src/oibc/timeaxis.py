@@ -43,6 +43,11 @@ def _require_op_dates(op_dates: pd.Series) -> pd.DatetimeIndex:
     return dti
 
 
+def require_op_dates(op_dates: pd.Series) -> None:
+    """운영일이 tz-aware Asia/Seoul 자정인지 검증한다."""
+    _require_op_dates(op_dates)
+
+
 def op_date(ts: pd.Series) -> pd.Series:
     """우측닫힘 시각을 운영일로 변환한다."""
     dti = _require_kst(ts, "ts")

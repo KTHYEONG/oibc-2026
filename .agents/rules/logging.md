@@ -14,7 +14,7 @@
   - `[DATA]`: Dataset loading, schema/timestamp validation, imputation, and panel construction.
   - `[FCST]`: Feature engineering, model training, inference, and forecast-error diagnostics.
   - `[VPP]`: VPP composition search, assignment constraints, and residual-correlation analysis.
-  - `[EVAL]`: Settlement `S`/`W` computation, validation folds, holdout results, and experiment comparison.
+  - `[EVAL]`: Settlement `S`/`W` computation, validation folds, fold results, and experiment comparison.
   - `[SUBMIT]`: Submission file generation, local validation, and submission records.
 - **Consistent Log Format:** Operational pipeline transitions and lifecycle log messages must include the category prefix: `logger.info("[<CATEGORY>] <event description>")`. Existing legacy log statements without category tags do not need to be refactored unless their immediate scope is being modified.
 - **Structured Fields:** Prefer structured key-value pairs or machine-readable records (such as JSONL or standardized delimited fields) over long conversational sentences.

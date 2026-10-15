@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import pairwise
 from pathlib import Path
 from typing import Literal
 
@@ -89,3 +90,102 @@ class DataPaths(BaseModel):
     raw_dir: Path = repo_root() / "data" / "raw" / "01_participant_dataset"
     canonical_dir: Path = repo_root() / "data" / "canonical"
     derived_dir: Path = repo_root() / "data" / "derived"
+
+
+class FoldSpec(BaseModel):
+    """검증 폴드: 시험 운영일 구간 [test_start, test_end]."""
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    name: str
+    test_start: pd.Timestamp = Field()
+    test_end: pd.Timestamp = Field()
+
+    @field_validator("test_start", "test_end", mode="before")
+    @classmethod
+    def _coerce_op_date(cls, v: object) -> pd.Timestamp:
+        ts = v if isinstance(v, pd.Timestamp) else pd.Timestamp(v)
+        if pd.isna(ts) or str(ts.tzinfo) != _KST:
+            raise ValueError("tz-aware Asia/Seoul required")
+        if ts != ts.floor("D"):
+            raise ValueError("fold boundary must be midnight")
+        return ts
+
+    @model_validator(mode="after")
+    def _check_fold(self) -> FoldSpec:
+        if not self.name:
+            raise ValueError("fold name must be non-empty")
+        if self.test_end < self.test_start:
+            raise ValueError("test_end must be on or after test_start")
+        return self
+
+
+class ValidationConfig(BaseModel):
+    """다중 기간 검증·시드 반복·채택 규칙 설정."""
+
+    model_config = ConfigDict(frozen=True)
+
+    folds: tuple[FoldSpec, ...] = (
+        FoldSpec(
+            name="A",
+            test_start=pd.Timestamp("2023-06-01 00:00", tz="Asia/Seoul"),
+            test_end=pd.Timestamp("2024-05-31 00:00", tz="Asia/Seoul"),
+        ),
+        FoldSpec(
+            name="B",
+            test_start=pd.Timestamp("2024-06-01 00:00", tz="Asia/Seoul"),
+            test_end=pd.Timestamp("2025-05-31 00:00", tz="Asia/Seoul"),
+        ),
+    )
+    embargo_days: int = 1
+    min_warm_days: int = 1
+    seeds: tuple[int, ...] = (0, 1, 2)
+    bootstrap_block_days: int = 7
+    bootstrap_n: int = 1000
+    bootstrap_seed: int = 0
+    ci_level: float = 0.95
+    min_rel_improvement: float = 0.01
+    min_quarter_win_ratio: float = 0.7
+
+    @model_validator(mode="after")
+    def _check_validation(self) -> ValidationConfig:
+        if len(self.folds) < 1:
+            raise ValueError("folds must contain at least one fold")
+        names = [f.name for f in self.folds]
+        if len(set(names)) != len(names):
+            raise ValueError("fold names must be distinct")
+        starts = [f.test_start for f in self.folds]
+        if any(b < a for a, b in pairwise(starts)):
+            raise ValueError("folds must be ordered by test_start")
+        for prev, nxt in pairwise(self.folds):
+            if nxt.test_start <= prev.test_end:
+                raise ValueError("fold test windows must not overlap")
+        last_op = (CompetitionSpec().train_end - pd.Timedelta(days=1)).floor("D")
+        if any(f.test_end > last_op for f in self.folds):
+            raise ValueError("fold test_end must not enter the evaluation period")
+        if self.embargo_days < 0:
+            raise ValueError("embargo_days must be >= 0")
+        if self.min_warm_days < 1:
+            raise ValueError("min_warm_days must be >= 1")
+        if len(self.seeds) < 1 or len(set(self.seeds)) != len(self.seeds):
+            raise ValueError("seeds must be non-empty and distinct")
+        if self.bootstrap_block_days < 1:
+            raise ValueError("bootstrap_block_days must be >= 1")
+        if self.bootstrap_n < 100:
+            raise ValueError("bootstrap_n must be >= 100")
+        if not 0.0 < self.ci_level < 1.0:
+            raise ValueError("ci_level must be in (0, 1)")
+        if not 0.0 <= self.min_rel_improvement < 1.0:
+            raise ValueError("min_rel_improvement must be in [0, 1)")
+        if not 0.0 < self.min_quarter_win_ratio <= 1.0:
+            raise ValueError("min_quarter_win_ratio must be in (0, 1]")
+        return self
+
+
+class ArtifactPaths(BaseModel):
+    """실험 산출물 경로."""
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    root: Path = repo_root() / "artifacts"
+    registry: Path = repo_root() / "artifacts" / "registry.jsonl"

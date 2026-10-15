@@ -240,5 +240,7 @@ legacy/
 # AI Experimentation & Scratch directories
 scratch/
 docs/specs/
+docs/memo.md
+docs/architecture/overview.md
 tmp/
 .serena/

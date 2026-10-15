@@ -189,3 +189,4 @@ class ArtifactPaths(BaseModel):
 
     root: Path = repo_root() / "artifacts"
     registry: Path = repo_root() / "artifacts" / "registry.jsonl"
+    submissions: Path = repo_root() / "artifacts" / "submissions"

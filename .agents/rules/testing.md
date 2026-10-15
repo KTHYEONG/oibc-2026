@@ -10,12 +10,13 @@
   - *On-Demand Utilities:* Skills (`probe`, `spec`, `implement`, `check`) are independent tools, not a mandatory sequential conveyor belt.
 - **Observable Behavior & Invariants:** Verify return contracts, state mutations, conservation laws, and error conditions rather than private implementation details or mock call-counts.
 - **In-Memory & Minimal Inputs:** Use the smallest deterministic synthetic data sufficient to test target logic near-instantaneously; never load multi-year disk datasets in unit tests.
-- **Functional Correctness Over Stochastic Outcomes:** Unit and integration tests verify contract correctness, edge cases, and schema transformations—never long-horizon statistical convergence or business outcomes.
+- **Functional Correctness Over Stochastic Outcomes:** Unit and integration tests verify contract correctness, edge cases, and schema transformations—never long-horizon statistical convergence or leaderboard outcomes; score comparisons belong in recorded `scratch/` experiments.
 
 ## 2. State Invariants & Boundary Testing
 - **Conservation & State Invariants:** Verify structural conservation laws: balance/resource reconciliations, allocation parity, deterministic outputs for identical inputs, and idempotent deduplication of operations.
-- **Temporal & Numerical Boundaries:** Stress-test boundary conditions rather than happy paths alone: zeros, NaNs, empty collections, missing keys, boundary timestamps, timezone transitions, and floating-point tolerances (explicit epsilon bounds, relative/absolute tolerances like `rtol`/`atol`).
-- **Causal Invariance:** Explicitly test that calculations do not access future time steps, uninitialized state, or unreleased data.
+- **Temporal & Numerical Boundaries:** Stress-test boundary conditions rather than happy paths alone: zeros, NaNs, empty collections, missing keys, boundary timestamps (`00:00`/`24:00` right-closed edges), night-time zero generation, and floating-point tolerances (explicit epsilon bounds, relative/absolute tolerances like `rtol`/`atol`).
+- **Causal Invariance:** Explicitly test that features and predictions for target date `D` do not change when data after the 17:00 KST `D-1` cutoff is corrupted.
+- **Competition Contracts:** Test the settlement formula against hand-computed cases, right-closed hourly alignment, VPP assignment validity (253 plants, exactly-once, capacity constraint), submission schema, and missing-forecast handling (rows retained, never dropped).
 
 ## 3. Execution, Latency Budgets & Failure Triage
 - **Latency Budgets:** Fast unit tests must execute near-instantaneously using in-memory fixtures. Heavy end-to-end simulations, full model retraining, or multi-year workloads must be marked with explicit boundary tags and isolated from default test runs.
@@ -23,7 +24,7 @@
 - **Process-Isolated Temp Workspaces:** Never wipe shared temp directories globally. Each test runner invocation operates in its own partitioned, process-isolated temporary workspace directory to prevent race conditions and ghost crashes between concurrent agents and developer terminal commands.
 - **Hermetic Environment Invariant:** Unit tests must be 100% hermetic and isolated from live shell credentials, ambient secret tokens, and production environment variables. Tests requiring specific configuration must declare explicit, isolated test fixtures rather than reading ambient host state.
 - **Tooling Artifact Awareness:** If tests pass alone but fail strictly under instrumentation (coverage or profiling), diagnose tracer overhead, timeout expiration, or multiprocessing/fork interference before assuming a domain code regression.
-- **Pragmatic Fixtures & Mocking:** Mock external boundaries (network APIs, clock/system time, filesystem I/O). Never mock internal domain calculations or transform tests into meaningless mock-chains.
+- **Pragmatic Fixtures & Mocking:** Mock external boundaries (clock/system time, filesystem I/O). Never mock internal domain calculations or transform tests into meaningless mock-chains.
 
 ## 4. Diff-Coverage & Quality Philosophy
 - **Diff-Coverage & Domain Focus:** Focus test coverage on newly-added production logic and critical boundary scenarios. Prune dead defensive branches rather than writing vacuous tests, and use coverage exclusion annotations sparingly for non-testable scaffolding.

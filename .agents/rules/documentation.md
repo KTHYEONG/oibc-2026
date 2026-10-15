@@ -18,4 +18,6 @@
 - **Contract & Code Reconciliation:** Treat discrepancies between code contracts and architecture documentation as issues to investigate and resolve; never silently assume either side is automatically correct.
 
 ## 4. Repository Language Conventions
-- **All Documentation & In-line Comments:** Written in concise Technical English for toolchain compatibility, token efficiency, and deterministic agent reasoning.
+- **Korean for Humans:** Documentation (`docs/architecture/`, `docs/specs/`, READMEs), docstrings, and in-line comments are written in concise natural Korean (한국어), because the owner reads and reviews them in Korean.
+- **English for Machines:** Identifiers, code, file paths, column names, CLI flags, and commit-independent technical terms stay in English; quote them verbatim inside Korean prose.
+- **Agent Instruction Files:** `AGENTS.md`, `.agents/rules/`, and `.agents/skills/` remain in English for deterministic agent behavior.

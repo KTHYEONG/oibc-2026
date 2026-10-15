@@ -232,7 +232,8 @@ catboost_info/
 *.cbm
 *.joblib
 /data/
-artifacts/models/
+artifacts/*
+!artifacts/.gitkeep
 legacy/
 .legacy/
 

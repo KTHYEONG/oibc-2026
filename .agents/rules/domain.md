@@ -17,7 +17,9 @@
 - **Perturbation Invariance:** Corrupting data after the cutoff must leave predictions for date `D` unchanged.
 
 ## 3. Validation & Leakage Control
-- **Chronological Splits:** Folds simulate the real cutoff and are time-ordered, with an untouched final holdout. Never tune on the holdout.
+- **Chronological Splits:** Folds simulate the real cutoff and are time-ordered over multiple expanding-window folds (`ValidationConfig.folds`). The last 12 training months were already used for model comparison and are no longer an untouched holdout; the evaluation-period leaderboard is the only untouched test. Never tune on leaderboard feedback.
+- **Seed Replication:** compare configurations by the mean over `ValidationConfig.seeds`; differences smaller than the observed seed range are inconclusive.
+- **Paired Uncertainty:** report per-fold relative ΔW with a day-block bootstrap CI and per-quarter signs; report warm-site and cold-start subsets separately.
 - **Leakage Surfaces:** Lag/rolling features, target encodings, scaler/imputer fits, plant-level statistics, and residuals used for VPP assignment must be fit on training data only.
 - **Observation vs. Forecast Weather:** Weather observations exist only for training (raw, with sentinel outliers such as `wa_wind_speed`=9999, `wb_cloud`>100). Models consumed at inference must be trained on forecast-weather inputs (or demonstrably robust to the shift); never train on observed weather and infer on forecasts without validating that gap.
 - **Statistical Humility:** Account for trial multiplicity across experiments and leaderboard submissions. Prefer performance plateaus over isolated parameter spikes, and report results across multiple periods and conditions.

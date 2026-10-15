@@ -6,9 +6,11 @@ import argparse
 import logging
 import time
 from collections.abc import Sequence
+from pathlib import Path
 
 from src.oibc.config import CompetitionSpec, DataPaths, QualityConfig
 from src.oibc.data import derived, ingest
+from src.oibc.submit.validate import validate_submission
 
 logger = logging.getLogger(__name__)
 
@@ -20,16 +22,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("ingest")
     sub.add_parser("derive")
+    validate_cmd = sub.add_parser("validate-submission")
+    validate_cmd.add_argument("--composition", type=Path, required=True)
+    validate_cmd.add_argument("--forecast", type=Path, required=True)
     args = parser.parse_args(list(argv) if argv is not None else None)
     start = time.perf_counter()
     logger.info("[SYS] pipeline %s start", args.command)
+    exit_code = 0
     if args.command == "ingest":
         ingest.build_canonical(DataPaths(), CompetitionSpec(), QualityConfig())
-    else:
+    elif args.command == "derive":
         derived.build_derived(DataPaths(), CompetitionSpec())
+    elif args.command == "validate-submission":
+        report = validate_submission(args.composition, args.forecast)
+        for warn in report.warnings:
+            logger.info("[SUBMIT] warning: %s", warn)
+        exit_code = 0 if report.ok else 1
     elapsed = time.perf_counter() - start
     logger.info("[SYS] pipeline %s done in %.1fs", args.command, elapsed)
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

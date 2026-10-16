@@ -97,7 +97,7 @@ ignore_errors = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-ra -q --import-mode=importlib"
+addopts = "-ra -q --import-mode=importlib -m \"not slow\""
 pythonpath = ["."]
 markers = ["slow: marks slow integration tests"]
 

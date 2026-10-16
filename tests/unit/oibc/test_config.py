@@ -3,7 +3,7 @@ import pytest
 from pathlib import Path
 from pydantic import ValidationError
 
-from src.oibc.config import CompetitionSpec, DataPaths, FeatureConfig, FoldSpec, ModelConfig, ValidationConfig, repo_root
+from src.oibc.config import CompetitionSpec, DataPaths, FeatureConfig, FoldSpec, ModelConfig, RunConfig, ValidationConfig, repo_root
 
 
 def test_default_spec_self_consistent() -> None:
@@ -294,3 +294,18 @@ def test_model_config_nonfinite_rejected(field: str, value: float) -> None:
 def test_model_config_invalid_lightgbm_parameters(kwargs: dict) -> None:
     with pytest.raises(ValueError, match="must"):
         ModelConfig(**kwargs)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"noise_z": 0.0}, {"noise_z": -1.0}, {"noise_z": float("inf")},
+    {"noise_z": float("nan")}, {"min_noise_df": 0},
+    {"ci_level": 1e-300}, {"ci_level": float.fromhex("0x1.fffffffffffffp-1")},
+])
+def test_validation_noise_params_rejected(kwargs: dict) -> None:
+    with pytest.raises(ValidationError):
+        ValidationConfig(**kwargs)
+
+
+def test_runconfig_commit_drift_default_denied() -> None:
+    cfg = RunConfig(run_id="r1", hypothesis="h")
+    assert cfg.allow_commit_drift is False

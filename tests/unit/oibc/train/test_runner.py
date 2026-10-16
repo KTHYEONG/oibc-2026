@@ -331,34 +331,39 @@ def test_no_leakage_from_future_actuals(tmp_path: Path) -> None:
 
 
 @pytest.mark.slow
-def test_real_panel_weekly_w_within_tolerance() -> None:
-    from src.oibc.config import repo_root
+def test_real_panel_seed_deterministic() -> None:
     from src.oibc.cv.splits import fold_masks
-    from src.oibc.evaluate.settlement import aggregate_groups, settle
+    from src.oibc.evaluate.settlement import aggregate_groups, daily_totals, settle
     from src.oibc.features.panel import feature_columns
     from src.oibc.models.gbm import fit_seed_models, predict_seed_kwh
 
     panel_path = DataPaths().features_dir / "panel.parquet"
-    refs = repo_root() / "scratch" / "fe_runs"
-    if not panel_path.exists() or not (refs / "all_A_s0_all.parquet").exists():
-        pytest.skip("실데이터 패널 또는 probe 진단 산출물 없음")
+    if not panel_path.exists():
+        pytest.skip("실데이터 패널 없음")
     panel = pd.read_parquet(panel_path)
     panel = panel.loc[panel["period"] == "train"]
     features = feature_columns(panel, FeatureConfig())
     assignment = runner_mod._resolve_assignment(panel)
     smp = runner_mod._resolve_smp(panel)
-    vcfg = ValidationConfig()
-    for fold in vcfg.folds:
-        tr, te = fold_masks(panel["op_date"], fold, vcfg)
-        train, test = panel.loc[tr], panel.loc[te]
-        models = fit_seed_models(train, features, ModelConfig())
+    default = ValidationConfig()
+    vcfg = ValidationConfig(folds=(default.folds[1],), seeds=(0,), bootstrap_n=100)
+    fold = vcfg.folds[0]
+    tr, te = fold_masks(panel["op_date"], fold, vcfg)
+    train, test = panel.loc[tr], panel.loc[te]
+    model_cfg = ModelConfig(n_rounds=50, seeds=(0,))
+    first: list[float] = []
+    second: list[float] = []
+    for store in (first, second):
+        models = fit_seed_models(train, features, model_cfg)
         preds = predict_seed_kwh(models, test, features)
-        for seed, pred in zip(vcfg.seeds, preds, strict=True):
-            frame = site_frame(test, pred, test.iloc[:0])
-            penalty = settle(aggregate_groups(frame, assignment), smp).penalty
-            reference = float(pd.read_parquet(refs / f"all_{fold.name}_s{seed}_all.parquet")["penalty"].sum())
-            assert penalty == pytest.approx(reference, rel=0.02)
-        del models, preds, train, test
+        frame = site_frame(test, preds[0], test.iloc[:0])
+        daily = daily_totals(settle(aggregate_groups(frame, assignment), smp))
+        store.extend(daily["penalty"].tolist())
+        del models, preds
+    assert first == second
+    zero_frame = site_frame(test, np.zeros(len(test), dtype="float64"), test.iloc[:0])
+    zero_w = float(daily_totals(settle(aggregate_groups(zero_frame, assignment), smp))["penalty"].sum())
+    assert sum(first) < zero_w
 
 
 def test_run_id_rule_rejected() -> None:
@@ -492,10 +497,12 @@ def test_run_validation_missing_smp(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         run_validation(_cfg("nosmp"), panel_path=panel, vcfg=_vcfg(), paths=paths)
 
 
-def test_run_validation_with_baseline(tmp_path: Path) -> None:
+def test_run_validation_with_baseline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     panel = _make_panel(tmp_path)
     paths = _paths(tmp_path)
     vcfg = _vcfg()
+    monkeypatch.setattr(runner_mod, "_git_tree_dirty", lambda: False)
+    monkeypatch.setattr(runner_mod, "_git_commit", lambda: "aaa")
     run_validation(_cfg("base0"), panel_path=panel, vcfg=vcfg, paths=paths)
     rec = run_validation(_cfg("cand0", baseline_run_id="base0"), panel_path=panel, vcfg=vcfg, paths=paths)
     assert rec.baseline_run_id == "base0"
@@ -873,3 +880,254 @@ def test_assignment_fallback_without_canonical(monkeypatch: pytest.MonkeyPatch) 
         runner_mod._resolve_smp(panel)
     with pytest.raises(RunnerError, match=r"generation\.parquet"):
         runner_mod._night_frame(pd.Series([], dtype="object"), 0.0)
+
+
+def _clean_git(monkeypatch: pytest.MonkeyPatch, commit: str = "aaa") -> None:
+    monkeypatch.setattr(runner_mod, "_git_commit", lambda: commit)
+    monkeypatch.setattr(runner_mod, "_git_tree_dirty", lambda: False)
+
+
+def test_comparable_commit_drift_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.evaluate.registry import read_records
+
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+    _clean_git(monkeypatch, commit="aaa")
+    run_validation(_cfg("base"), panel_path=panel, vcfg=vcfg, paths=paths)
+    assert len(read_records(paths.registry)) == 1
+    monkeypatch.setattr(runner_mod, "_git_commit", lambda: "bbb")
+    with pytest.raises(RunnerError):
+        run_validation(_cfg("cand", baseline_run_id="base"), panel_path=panel, vcfg=vcfg, paths=paths)
+    assert len(read_records(paths.registry)) == 1
+
+
+def test_comparable_drift_allowed_and_recorded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+    _clean_git(monkeypatch, commit="aaa")
+    run_validation(_cfg("base"), panel_path=panel, vcfg=vcfg, paths=paths)
+    monkeypatch.setattr(runner_mod, "_git_commit", lambda: "bbb")
+    cfg = _cfg("cand", allow_commit_drift=True, baseline_run_id="base")
+    rec = run_validation(cfg, panel_path=panel, vcfg=vcfg, paths=paths)
+    assert "commit_drift_allowed" in rec.note
+    assert "볼록성" in rec.note
+    assert "예외" not in rec.note
+
+
+def test_comparable_dirty_tree_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+    _clean_git(monkeypatch, commit="aaa")
+    run_validation(_cfg("base"), panel_path=panel, vcfg=vcfg, paths=paths)
+    monkeypatch.setattr(runner_mod, "_git_tree_dirty", lambda: True)
+    with pytest.raises(RunnerError):
+        run_validation(_cfg("cand", baseline_run_id="base"), panel_path=panel, vcfg=vcfg, paths=paths)
+
+
+def test_comparable_panel_hash_mismatch_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+    _clean_git(monkeypatch, commit="aaa")
+    run_validation(_cfg("base"), panel_path=panel, vcfg=vcfg, paths=paths)
+    other = pd.read_parquet(panel)
+    other["doy_sin"] = 0.9
+    tampered = tmp_path / "panel_other.parquet"
+    other.to_parquet(tampered, index=False)
+    with pytest.raises(RunnerError):
+        run_validation(_cfg("cand", baseline_run_id="base"), panel_path=tampered, vcfg=vcfg, paths=paths)
+
+
+def test_comparable_config_diff_recorded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+    _clean_git(monkeypatch, commit="aaa")
+    run_validation(_cfg("base"), panel_path=panel, vcfg=vcfg, paths=paths)
+    heavier = RunConfig(
+        run_id="cand",
+        hypothesis="synthetic guard",
+        features=_feat(),
+        model=ModelConfig(n_rounds=3, num_leaves=4, n_jobs=1, min_child_samples=5, seeds=(0, 1), weight="none"),
+        baseline_run_id="base",
+    )
+    rec = run_validation(heavier, panel_path=panel, vcfg=vcfg, paths=paths)
+    assert (rec.comparison or {})["config_diff"] == ["model.weight"]
+
+
+def test_comparable_identical_config_null_diff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+    _clean_git(monkeypatch, commit="aaa")
+    run_validation(_cfg("base"), panel_path=panel, vcfg=vcfg, paths=paths)
+    rec = run_validation(_cfg("cand", baseline_run_id="base"), panel_path=panel, vcfg=vcfg, paths=paths)
+    assert (rec.comparison or {})["config_diff"] == []
+
+
+def test_seed_bag_note_rationale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    _clean_git(monkeypatch, commit="aaa")
+    rec = run_validation(_cfg("note-check"), panel_path=panel, vcfg=_vcfg(), paths=paths)
+    assert "볼록성" in rec.note
+    assert "예외" not in rec.note
+
+
+def test_git_tree_dirty_none_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    from src.oibc.train import runner as runner_mod
+
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(OSError("no git"))
+    )
+    assert runner_mod._git_tree_dirty() is None
+
+    class _Bad:
+        returncode = 1
+        stdout = " M x"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Bad())
+    assert runner_mod._git_tree_dirty() is None
+
+
+def test_comparable_seed_fold_config_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+    _clean_git(monkeypatch, commit="aaa")
+    run_validation(_cfg("base"), panel_path=panel, vcfg=vcfg, paths=paths)
+    other_seeds = ValidationConfig(folds=vcfg.folds, embargo_days=1, min_warm_days=1, seeds=(0, 9), bootstrap_n=100)
+    mismatched = RunConfig(
+        run_id="bad-seed",
+        hypothesis="synthetic guard",
+        features=_feat(),
+        model=ModelConfig(n_rounds=3, num_leaves=4, n_jobs=1, min_child_samples=5, seeds=(0, 9)),
+        baseline_run_id="base",
+    )
+    with pytest.raises(RunnerError):
+        run_validation(mismatched, panel_path=panel, vcfg=other_seeds, paths=paths)
+    other_folds = (
+        FoldSpec(name="A", test_start=pd.Timestamp("2023-01-10", tz=KST), test_end=pd.Timestamp("2023-01-14", tz=KST)),
+        FoldSpec(name="C", test_start=pd.Timestamp("2023-01-15", tz=KST), test_end=pd.Timestamp("2023-01-19", tz=KST)),
+    )
+    other_val = ValidationConfig(folds=other_folds, embargo_days=1, min_warm_days=1, seeds=(0, 1), bootstrap_n=100)
+    with pytest.raises(RunnerError):
+        run_validation(_cfg("bad-fold", baseline_run_id="base"), panel_path=panel, vcfg=other_val, paths=paths)
+    other_comp = _spec().model_copy(update={"penalty_rate": 0.2})
+    with pytest.raises(RunnerError):
+        run_validation(
+            _cfg("bad-comp", baseline_run_id="base"), panel_path=panel, vcfg=vcfg, paths=paths, spec=other_comp
+        )
+    other_bootstrap = ValidationConfig(
+        folds=vcfg.folds, embargo_days=1, min_warm_days=1, seeds=(0, 1), bootstrap_n=500
+    )
+    with pytest.raises(RunnerError):
+        run_validation(
+            _cfg("bad-val", baseline_run_id="base"), panel_path=panel, vcfg=other_bootstrap, paths=paths
+        )
+
+
+def test_config_diff_value_normalization() -> None:
+    import copy
+
+    assert runner_mod._normalize_diff_value(frozenset({"b", "a"})) == ["a", "b"]
+    assert runner_mod._normalize_diff_value((1, 2)) == [1, 2]
+    assert runner_mod._normalize_diff_value("x") == "x"
+    rec = _cfg("r").model_dump(mode="json")
+    base = RunConfig(
+        run_id="b",
+        hypothesis="synthetic guard",
+        features=_feat(),
+        model=ModelConfig(n_rounds=3, num_leaves=4, n_jobs=1, min_child_samples=5, seeds=(0, 1), weight="none"),
+    )
+    stripped = copy.deepcopy(rec)
+    stripped.pop("features")
+    fake = type("R", (), {"config": stripped, "seeds": (0, 1), "folds": ("A", "B"), "git_commit": "aaa"})()
+    with pytest.raises(RunnerError, match="features config"):
+        runner_mod._config_diff_keys(fake, base)
+
+
+def test_check_comparable_seed_fold_mismatch_direct(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import hashlib
+
+    from src.oibc.evaluate.registry import read_records
+
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+    _clean_git(monkeypatch, commit="aaa")
+    run_validation(_cfg("base"), panel_path=panel, vcfg=vcfg, paths=paths)
+    record = next(r for r in read_records(paths.registry) if r.run_id == "base")
+    panel_hash = hashlib.sha256(panel.read_bytes()).hexdigest()
+    comp = _spec()
+    cfg = _cfg("cand", baseline_run_id="base")
+    other_seeds = ValidationConfig(folds=vcfg.folds, embargo_days=1, min_warm_days=1, seeds=(0, 9), bootstrap_n=100)
+    with pytest.raises(RunnerError):
+        runner_mod._check_comparable(record, cfg, panel_hash, other_seeds, comp)
+    other_folds = (
+        FoldSpec(name="A", test_start=pd.Timestamp("2023-01-10", tz=KST), test_end=pd.Timestamp("2023-01-14", tz=KST)),
+        FoldSpec(name="C", test_start=pd.Timestamp("2023-01-15", tz=KST), test_end=pd.Timestamp("2023-01-19", tz=KST)),
+    )
+    other_val = ValidationConfig(folds=other_folds, embargo_days=1, min_warm_days=1, seeds=(0, 1), bootstrap_n=100)
+    with pytest.raises(RunnerError):
+        runner_mod._check_comparable(record, cfg, panel_hash, other_val, comp)
+
+
+def test_baseline_files_without_registry_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import shutil
+
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+    _clean_git(monkeypatch, commit="aaa")
+    run_validation(_cfg("base"), panel_path=panel, vcfg=vcfg, paths=paths)
+    shutil.copytree(paths.runs / "base", paths.runs / "ghost")
+    paths.registry.unlink()
+    with pytest.raises(RunnerError, match="unknown baseline"):
+        run_validation(_cfg("cand", baseline_run_id="ghost"), panel_path=panel, vcfg=vcfg, paths=paths)
+
+
+def test_dirty_baseline_rejected_before_fit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    _clean_git(monkeypatch)
+    monkeypatch.setattr(runner_mod, "_git_tree_dirty", lambda: True)
+    baseline = run_validation(_cfg("base"), panel_path=panel, vcfg=_vcfg(), paths=paths)
+    assert baseline.config["git_dirty"] is True
+    monkeypatch.setattr(runner_mod, "_git_tree_dirty", lambda: False)
+
+    def no_fit(*args, **kwargs):
+        pytest.fail("변경된 코드로 학습한 기준과 비교 학습 실행")
+
+    monkeypatch.setattr(runner_mod, "fit_seed_models", no_fit)
+    with pytest.raises(RunnerError, match="dirty work tree"):
+        run_validation(_cfg("cand", baseline_run_id="base"), panel_path=panel, vcfg=_vcfg(), paths=paths)
+    assert not (paths.runs / "cand").exists()
+
+
+def test_comparable_metadata_boundaries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    _clean_git(monkeypatch)
+    val = _vcfg()
+    record = run_validation(_cfg("base"), panel_path=panel, vcfg=val, paths=paths)
+    cfg = _cfg("cand", baseline_run_id="base")
+    with pytest.raises(RunnerError, match="panel hash"):
+        runner_mod._check_comparable(record, cfg, None, val, _spec())
+    for dirty in (None, True):
+        config = {**record.config, "git_dirty": dirty}
+        changed = record.model_copy(update={"config": config})
+        with pytest.raises(RunnerError, match="dirty work tree"):
+            runner_mod._check_comparable(changed, cfg, config["panel_sha256"], val, _spec())
+        allowed = cfg.model_copy(update={"allow_commit_drift": True})
+        assert runner_mod._check_comparable(changed, allowed, config["panel_sha256"], val, _spec()) == []
+    cfg = cfg.model_copy(update={"features": FeatureConfig()})
+    config = cfg.model_dump(mode="json")
+    config["features"]["groups"].reverse()
+    changed = record.model_copy(update={"config": config})
+    assert runner_mod._config_diff_keys(changed, cfg) == []

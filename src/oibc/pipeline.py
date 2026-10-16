@@ -42,6 +42,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     val.add_argument("--baseline", default=None)
     val.add_argument("--drop-group", action="append", choices=sorted(FeatureConfig().groups), default=[])
     val.add_argument("--weight", choices=["smp_k_cap", "k_cap", "none"], default="smp_k_cap")
+    val.add_argument("--allow-commit-drift", action="store_true")
     sub_cmd = sub.add_parser("submit")
     sub_cmd.add_argument("--run-id", required=True)
     sub_cmd.add_argument("--sub-id", required=True)
@@ -71,6 +72,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 baseline_run_id=args.baseline,
                 features=FeatureConfig(groups=frozenset(groups)),
                 model=ModelConfig(weight=args.weight),
+                allow_commit_drift=args.allow_commit_drift,
             )
         )
     elif args.command == "submit":

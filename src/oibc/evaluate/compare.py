@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from statistics import NormalDist
 from typing import Literal
 
 import numpy as np
@@ -37,6 +40,10 @@ class FoldComparison:
     quarter_rel: dict[str, float]
     seed_range_candidate: float
     seed_range_baseline: float
+    se_boot: float
+    se_train: float
+    ci_total_low: float
+    ci_total_high: float
 
 
 @dataclass(frozen=True)
@@ -49,6 +56,11 @@ class Comparison:
     max_seed_range: float
     decision: Decision
     reasons: tuple[str, ...]
+    train_noise_sd: float
+    train_noise_df: int
+    pooled_se_train: float
+    pooled_ci_total_low: float
+    pooled_ci_total_high: float
 
 
 def _frame_vectors(frame: pd.DataFrame, label: str) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]:
@@ -115,14 +127,29 @@ def _quarter_rel(
     return out
 
 
-def _fold_result(
+@dataclass
+class _FoldIntermediate:
+    fold: str
+    w_candidate: float
+    w_baseline: float
+    rel_delta: float
+    ci_low: float
+    ci_high: float
+    quarter_rel: dict[str, float]
+    seed_range_candidate: float
+    seed_range_baseline: float
+    cand_totals: np.ndarray
+    base_totals: np.ndarray
+
+
+def _fold_intermediate(
     fold: str,
     cand_frames: Sequence[pd.DataFrame],
     base_frames: Sequence[pd.DataFrame],
     rng: np.random.Generator,
-    cfg: ValidationConfig,
     reasons: list[str],
-) -> FoldComparison:
+    cfg: ValidationConfig,
+) -> _FoldIntermediate:
     if len(cand_frames) == 0 or len(base_frames) == 0:
         raise CompareError(f"fold {fold}: need at least one seed result per side")
     if len(cand_frames) != len(base_frames):
@@ -137,7 +164,7 @@ def _fold_result(
     for _, _, rev in parsed[1:]:
         if not np.allclose(rev, first_rev, rtol=1e-9, atol=1e-6):
             raise CompareError(f"fold {fold}: revenue mismatch")
-    n_c, n_b = len(cand_frames), len(base_frames)
+    n_c = len(cand_frames)
     cand_mat = np.array([p[1] for p in parsed[:n_c]], dtype=np.float64)
     base_mat = np.array([p[1] for p in parsed[n_c:]], dtype=np.float64)
     cand = cand_mat.mean(axis=0)
@@ -148,7 +175,7 @@ def _fold_result(
     rel = w_c / w_b - 1.0
     ci_low, ci_high = _block_ci(cand, base, rng, cfg)
     quarters = _quarter_rel(cand, base, first_days, fold, reasons)
-    result = FoldComparison(
+    return _FoldIntermediate(
         fold=fold,
         w_candidate=w_c,
         w_baseline=w_b,
@@ -158,19 +185,13 @@ def _fold_result(
         quarter_rel=quarters,
         seed_range_candidate=_seed_range(cand_mat.sum(axis=1)),
         seed_range_baseline=_seed_range(base_mat.sum(axis=1)),
+        cand_totals=cand_mat.sum(axis=1),
+        base_totals=base_mat.sum(axis=1),
     )
-    logger.info(
-        "[EVAL] fold=%s W_c=%r W_b=%r rel=%r ci=[%r,%r] seeds=%d/%d",
-        fold,
-        w_c,
-        w_b,
-        rel,
-        ci_low,
-        ci_high,
-        n_c,
-        n_b,
-    )
-    return result
+
+
+def _z_value(ci_level: float) -> float:
+    return float(NormalDist().inv_cdf((1.0 + ci_level) / 2.0))
 
 
 def compare_runs(candidate: DailyRuns, baseline: DailyRuns, cfg: ValidationConfig) -> Comparison:
@@ -180,51 +201,126 @@ def compare_runs(candidate: DailyRuns, baseline: DailyRuns, cfg: ValidationConfi
         raise CompareError(f"fold set must equal {sorted(want)}")
     rng = np.random.default_rng(cfg.bootstrap_seed)
     reasons: list[str] = []
+    partials = tuple(
+        _fold_intermediate(f.name, candidate[f.name], baseline[f.name], rng, reasons, cfg) for f in cfg.folds
+    )
+    sq_sum = 0.0
+    df = 0
+    for part in partials:
+        for side, totals in (("candidate", part.cand_totals), ("baseline", part.base_totals)):
+            n = int(totals.size)
+            mean = float(totals.mean())
+            if mean == 0.0:
+                reasons.append(f"noise_excluded={part.fold}:{side}")
+                continue
+            dev = totals / mean - 1.0
+            sq_sum += float(np.sum(dev * dev))
+            df += n - 1
+    sd = float(math.sqrt(sq_sum / df)) if df > 0 else 0.0
+    z = _z_value(cfg.ci_level)
+    se_boot_list: list[float] = []
+    se_train_list: list[float] = []
+    total_low: list[float] = []
+    total_high: list[float] = []
+    for part in partials:
+        se_boot = (part.ci_high - part.ci_low) / (2.0 * z)
+        n_c = int(part.cand_totals.size)
+        n_b = int(part.base_totals.size)
+        se_train = sd * math.sqrt(1.0 / n_c + 1.0 / n_b)
+        width = math.sqrt(se_boot * se_boot + se_train * se_train)
+        se_boot_list.append(se_boot)
+        se_train_list.append(se_train)
+        total_low.append(part.rel_delta - z * width)
+        total_high.append(part.rel_delta + z * width)
     folds = tuple(
-        _fold_result(f.name, candidate[f.name], baseline[f.name], rng, cfg, reasons) for f in cfg.folds
+        FoldComparison(
+            fold=part.fold,
+            w_candidate=part.w_candidate,
+            w_baseline=part.w_baseline,
+            rel_delta=part.rel_delta,
+            ci_low=part.ci_low,
+            ci_high=part.ci_high,
+            quarter_rel=part.quarter_rel,
+            seed_range_candidate=part.seed_range_candidate,
+            seed_range_baseline=part.seed_range_baseline,
+            se_boot=se_boot_list[i],
+            se_train=se_train_list[i],
+            ci_total_low=total_low[i],
+            ci_total_high=total_high[i],
+        )
+        for i, part in enumerate(partials)
     )
     pooled = float(sum(f.rel_delta for f in folds) / len(folds))
     wins = sum(1 for f in folds for v in f.quarter_rel.values() if v < 0.0)
     total = sum(len(f.quarter_rel) for f in folds)
     ratio = float(wins / total) if total > 0 else 0.0
     largest = max(max(f.seed_range_candidate, f.seed_range_baseline) for f in folds)
+    n_folds = float(len(folds))
+    pooled_se_train = float(math.sqrt(sum(s * s for s in se_train_list)) / n_folds)
+    pooled_se_total = float(math.sqrt(sum(a * a + b * b for a, b in zip(se_boot_list, se_train_list, strict=True))) / n_folds)
+    pooled_ci_low = float(pooled - z * pooled_se_total)
+    pooled_ci_high = float(pooled + z * pooled_se_total)
     improved = [f.fold for f in folds if f.rel_delta >= 0.0]
     reasons.extend(f"fold_not_improved={name}" for name in improved)
     if -pooled < cfg.min_rel_improvement:
         reasons.append(f"pooled={pooled:.4g}<min={cfg.min_rel_improvement:g}")
-    if -pooled <= largest:
-        reasons.append(f"seed_noise={largest:.4g}>=gain={-pooled:.4g}")
+    if df < cfg.min_noise_df:
+        reasons.append(f"train_noise_df={df}<min={cfg.min_noise_df}")
+    noise_threshold = cfg.noise_z * pooled_se_train
+    if not -pooled > noise_threshold:
+        reasons.append(f"train_noise={-pooled:.4g} <= z*se={noise_threshold:.4g}")
+    if not pooled_ci_high < 0.0:
+        reasons.append(f"ci_total_high={pooled_ci_high:.4g}>=0")
     if ratio < cfg.min_quarter_win_ratio:
         reasons.append(f"quarters={ratio:.4g}<min={cfg.min_quarter_win_ratio:g}")
-    if not improved and -pooled >= cfg.min_rel_improvement and -pooled > largest and ratio >= cfg.min_quarter_win_ratio:
+    all_improved = not improved
+    adoptable = (
+        all_improved
+        and -pooled >= cfg.min_rel_improvement
+        and df >= cfg.min_noise_df
+        and -pooled > noise_threshold
+        and pooled_ci_high < 0.0
+        and ratio >= cfg.min_quarter_win_ratio
+    )
+    if adoptable:
         decision: Decision = "adopt"
-        kept = [r for r in reasons if r.startswith("quarter_excluded=")]
+        kept = [r for r in reasons if r.startswith("quarter_excluded=") or r.startswith("noise_excluded=")]
         reasons = kept
-    elif all(f.rel_delta > 0.0 for f in folds) and pooled >= cfg.min_rel_improvement:
+    elif all(f.rel_delta > 0.0 for f in folds) and pooled >= cfg.min_rel_improvement and pooled_ci_low > 0.0:
         decision = "reject"
     else:
         decision = "inconclusive"
     logger.info(
-        "[EVAL] decision=%s pooled=%r seed_noise=%r quarters=%r reasons=%r",
+        "[EVAL] decision=%s pooled=%r train_noise_sd=%r df=%r pooled_ci_total=[%r,%r] quarters=%r reasons=%r",
         decision,
         pooled,
-        largest,
+        sd,
+        df,
+        pooled_ci_low,
+        pooled_ci_high,
         ratio,
         reasons,
     )
-    return Comparison(
+    result = Comparison(
         folds=folds,
         pooled_rel_delta=pooled,
         quarter_win_ratio=ratio,
         max_seed_range=largest,
         decision=decision,
         reasons=tuple(reasons),
+        train_noise_sd=sd,
+        train_noise_df=df,
+        pooled_se_train=pooled_se_train,
+        pooled_ci_total_low=pooled_ci_low,
+        pooled_ci_total_high=pooled_ci_high,
     )
+    comparison_to_dict(result)
+    return result
 
 
 def comparison_to_dict(comparison: Comparison) -> dict[str, object]:
     """Comparison을 JSON 직렬화 가능한 dict로 변환한다."""
-    return {
+    payload: dict[str, object] = {
         "folds": [
             {
                 "fold": f.fold,
@@ -236,6 +332,10 @@ def comparison_to_dict(comparison: Comparison) -> dict[str, object]:
                 "quarter_rel": {k: float(v) for k, v in f.quarter_rel.items()},
                 "seed_range_candidate": float(f.seed_range_candidate),
                 "seed_range_baseline": float(f.seed_range_baseline),
+                "se_boot": float(f.se_boot),
+                "se_train": float(f.se_train),
+                "ci_total_low": float(f.ci_total_low),
+                "ci_total_high": float(f.ci_total_high),
             }
             for f in comparison.folds
         ],
@@ -244,4 +344,14 @@ def comparison_to_dict(comparison: Comparison) -> dict[str, object]:
         "max_seed_range": float(comparison.max_seed_range),
         "decision": comparison.decision,
         "reasons": list(comparison.reasons),
+        "train_noise_sd": float(comparison.train_noise_sd),
+        "train_noise_df": int(comparison.train_noise_df),
+        "pooled_se_train": float(comparison.pooled_se_train),
+        "pooled_ci_total_low": float(comparison.pooled_ci_total_low),
+        "pooled_ci_total_high": float(comparison.pooled_ci_total_high),
     }
+    try:
+        json.dumps(payload, allow_nan=False)
+    except ValueError as exc:
+        raise CompareError("comparison values must be finite") from exc
+    return payload

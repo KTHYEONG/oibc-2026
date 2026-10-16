@@ -3,7 +3,7 @@ import pytest
 from pathlib import Path
 from pydantic import ValidationError
 
-from src.oibc.config import CompetitionSpec, DataPaths, FoldSpec, ValidationConfig, repo_root
+from src.oibc.config import CompetitionSpec, DataPaths, FeatureConfig, FoldSpec, ValidationConfig, repo_root
 
 
 def test_default_spec_self_consistent() -> None:
@@ -175,3 +175,81 @@ def test_unordered_folds_rejected() -> None:
 def test_validation_bounds_rejected(kwargs: object) -> None:
     with pytest.raises(ValidationError):
         ValidationConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_features_dir_under_repo_root(tmp_path: Path) -> None:
+    p = DataPaths()
+    assert p.features_dir == repo_root() / "data" / "features"
+    assert DataPaths(features_dir=tmp_path).features_dir == tmp_path
+
+
+def test_feature_config_defaults_valid() -> None:
+    cfg = FeatureConfig()
+    assert cfg.groups == {"cs", "rd", "day", "fleet"}
+    assert cfg.day_round in CompetitionSpec().rounds
+
+
+def test_feature_config_subset_violation_rejected() -> None:
+    with pytest.raises(ValidationError, match="rd_vars"):
+        FeatureConfig(rd_vars=("wa_cloud", "wa_unknown_var"))
+
+
+def test_feature_config_even_window_rejected() -> None:
+    with pytest.raises(ValidationError, match="day_roll_window"):
+        FeatureConfig(day_roll_window=4)
+
+
+def test_feature_config_zero_offset_rejected() -> None:
+    with pytest.raises(ValidationError, match="neighbor_offsets"):
+        FeatureConfig(neighbor_offsets=(0, 1))
+
+
+def test_feature_config_prefix_violation_rejected() -> None:
+    with pytest.raises(ValidationError, match="prefix"):
+        FeatureConfig(wa_vars=("xx_cloud", "wa_temp"))
+
+
+def test_feature_config_duplicate_vars_rejected() -> None:
+    with pytest.raises(ValidationError, match="duplicates"):
+        FeatureConfig(wa_vars=("wa_cloud", "wa_cloud"))
+
+
+def test_feature_config_wb_subset_violation_rejected() -> None:
+    with pytest.raises(ValidationError, match="neighbor_vars"):
+        FeatureConfig(neighbor_vars=("wb_unknown_var",))
+
+
+def test_feature_config_bare_subset_violation_rejected() -> None:
+    with pytest.raises(ValidationError, match="neighbor_vars"):
+        FeatureConfig(neighbor_vars=("cloud",))
+
+
+def test_feature_config_vsfleet_violation_rejected() -> None:
+    with pytest.raises(ValidationError, match="vsfleet_vars"):
+        FeatureConfig(vsfleet_vars=("wa_rain",))
+
+
+def test_feature_config_day_round_rejected() -> None:
+    with pytest.raises(ValidationError, match="day_round"):
+        FeatureConfig(day_round=9)
+
+
+def test_feature_config_duplicate_offsets_rejected() -> None:
+    with pytest.raises(ValidationError, match="duplicates"):
+        FeatureConfig(day_shift_offsets=(-2, -2))
+
+
+def test_feature_config_day_hours_rejected() -> None:
+    with pytest.raises(ValidationError, match="day_hours"):
+        FeatureConfig(day_hours=(16, 9))
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"wa_vars": ("wb_cloud",)},
+    {"wb_vars": ("wb_cloud",)},
+    {"day_min_elev_deg": float("nan")},
+    {"day_min_elev_deg": float("inf")},
+])
+def test_feature_config_unbuildable_inputs_rejected(kwargs: dict) -> None:
+    with pytest.raises(ValidationError):
+        FeatureConfig(**kwargs)

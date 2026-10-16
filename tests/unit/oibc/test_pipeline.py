@@ -8,6 +8,7 @@ import pytest
 from src.oibc.config import CompetitionSpec, DataPaths
 from src.oibc.data import derived as derived_mod
 from src.oibc.data import ingest as ingest_mod
+from src.oibc.features import panel as panel_mod
 from src.oibc.pipeline import main
 from src.oibc.submit import validate as validate_mod
 from src.oibc.submit.validate import load_reference
@@ -30,6 +31,13 @@ def test_derive_dispatches_to_build_derived(monkeypatch: pytest.MonkeyPatch) -> 
     calls: list[tuple[object, ...]] = []
     monkeypatch.setattr(derived_mod, "build_derived", lambda *args: calls.append(args))
     assert main(["derive"]) == 0
+    assert len(calls) == 1
+
+
+def test_features_dispatches_to_build_features(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(panel_mod, "build_features", lambda *args: calls.append(args))
+    assert main(["features"]) == 0
     assert len(calls) == 1
 
 

@@ -3,7 +3,7 @@ import pytest
 from pathlib import Path
 from pydantic import ValidationError
 
-from src.oibc.config import CompetitionSpec, DataPaths, FeatureConfig, FoldSpec, ValidationConfig, repo_root
+from src.oibc.config import CompetitionSpec, DataPaths, FeatureConfig, FoldSpec, ModelConfig, ValidationConfig, repo_root
 
 
 def test_default_spec_self_consistent() -> None:
@@ -253,3 +253,44 @@ def test_feature_config_day_hours_rejected() -> None:
 def test_feature_config_unbuildable_inputs_rejected(kwargs: dict) -> None:
     with pytest.raises(ValidationError):
         FeatureConfig(**kwargs)
+
+
+def test_model_config_defaults_valid() -> None:
+    cfg = ModelConfig()
+    assert cfg.seeds == (0, 1, 2)
+    assert cfg.weight == "smp_k_cap"
+
+
+def test_model_config_duplicate_seeds_rejected() -> None:
+    with pytest.raises(ValueError, match="seeds"):
+        ModelConfig(seeds=(0, 0))
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"learning_rate": 0.0},
+    {"learning_rate": 1.5},
+    {"num_leaves": 1},
+    {"n_rounds": 0},
+    {"n_jobs": 0},
+    {"subsample": 0.0},
+    {"colsample_bytree": 0.0},
+    {"seeds": ()},
+    {"target_clip_max": 0.9},
+    {"min_weight": 0.0},
+])
+def test_model_config_bounds_rejected(kwargs: dict) -> None:
+    with pytest.raises(ValueError, match=r"must"):
+        ModelConfig(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["learning_rate", "subsample", "colsample_bytree", "reg_lambda", "target_clip_max", "min_weight"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_model_config_nonfinite_rejected(field: str, value: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        ModelConfig(**{field: value})
+
+
+@pytest.mark.parametrize("kwargs", [{"min_child_samples": 0}, {"subsample_freq": -1}, {"reg_lambda": -1.0}])
+def test_model_config_invalid_lightgbm_parameters(kwargs: dict) -> None:
+    with pytest.raises(ValueError, match="must"):
+        ModelConfig(**kwargs)

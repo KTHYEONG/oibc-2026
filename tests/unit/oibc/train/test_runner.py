@@ -1603,3 +1603,201 @@ def test_load_oof_preserves_schema_and_row_pairing(tmp_path: Path, defect: str |
     else:
         expected = frame.sort_values(["site_id", "ts"]).reset_index(drop=True)
         pd.testing.assert_frame_equal(load_oof("schema", "A", paths=paths), expected)
+
+
+def _netting_run(tmp_path: Path, run_id: str = "net1") -> tuple[Path, ArtifactPaths]:
+    from src.oibc.compose.store import write_composition
+    from src.oibc.config import ComposeConfig
+
+    panel = _make_panel(tmp_path)
+    paths = _comp_paths(tmp_path)
+    write_composition(_swapped_assignment(), "t1", ComposeConfig(), _sites4(), paths=paths, spec=_spec())
+    run_validation(_cfg(run_id), panel_path=panel, vcfg=_vcfg(), paths=paths, spec=_spec(), save_oof=True)
+    return panel, paths
+
+
+def test_netting_report_structure_and_identity(tmp_path: Path) -> None:
+    from src.oibc.train.runner import netting_report
+
+    _, paths = _netting_run(tmp_path)
+    report = netting_report("net1", ["current_group", "t1"], n_random=4, seed=0, paths=paths, spec=_spec())
+    assert report["run_id"] == "net1" and report["n_random"] == 4 and report["seed"] == 0
+    assert set(report["compositions"]) == {"current_group", "t1"}
+    for fold in ("A", "B"):
+        entry = report["folds"][fold]
+        assert set(entry) == {"pool_penalty", "compositions", "random", "capacity_balanced", "composition_percentile_vs_random"}
+        for vals in entry["compositions"].values():
+            assert set(vals) == {"penalty", "netting_loss", "netting_share"}
+            assert vals["penalty"] == pytest.approx(entry["pool_penalty"] + vals["netting_loss"])
+        assert set(entry["random"]) == {"mean", "sd", "p05", "p50", "p95"}
+
+
+def test_netting_report_reference_matches_run_bag(tmp_path: Path) -> None:
+    from src.oibc.train.runner import netting_report
+
+    _, paths = _netting_run(tmp_path, "netbag")
+    report = netting_report("netbag", ["current_group"], n_random=2, seed=1, paths=paths, spec=_spec())
+    for fold in ("A", "B"):
+        saved = runner_mod._normalize_daily(
+            pd.read_parquet(paths.runs / "netbag" / f"{fold}_bag_all.parquet"), "x"
+        )
+        assert report["folds"][fold]["compositions"]["current_group"]["penalty"] == pytest.approx(
+            float(saved["penalty"].sum()), rel=1e-9
+        )
+
+
+def test_netting_report_deterministic(tmp_path: Path) -> None:
+    from src.oibc.train.runner import netting_report
+
+    _, paths = _netting_run(tmp_path, "netdet")
+    first = netting_report("netdet", ["current_group"], n_random=4, seed=2, paths=paths, spec=_spec())
+    second = netting_report("netdet", ["current_group"], n_random=4, seed=2, paths=paths, spec=_spec())
+    assert first == second
+
+
+def test_netting_report_requires_oof(tmp_path: Path) -> None:
+    from src.oibc.train.runner import netting_report
+
+    panel = _make_panel(tmp_path)
+    paths = _comp_paths(tmp_path)
+    run_validation(_cfg("nooof"), panel_path=panel, vcfg=_vcfg(), paths=paths, spec=_spec())
+    with pytest.raises(RunnerError):
+        netting_report("nooof", ["current_group"], n_random=2, seed=0, paths=paths, spec=_spec())
+
+
+def test_netting_report_rejects_bad_args(tmp_path: Path) -> None:
+    from src.oibc.train.runner import netting_report
+
+    _, paths = _netting_run(tmp_path, "netbad")
+    with pytest.raises(RunnerError):
+        netting_report("netbad", ["current_group"], n_random=0, paths=paths, spec=_spec())
+    with pytest.raises(RunnerError):
+        netting_report("netbad", [], n_random=2, paths=paths, spec=_spec())
+    with pytest.raises(RunnerError):
+        netting_report("netbad", ["current_group", "current_group"], n_random=2, paths=paths, spec=_spec())
+
+
+def test_netting_report_fail_closed_branches(tmp_path: Path) -> None:
+    from src.oibc.train.runner import netting_report
+
+    _, paths = _netting_run(tmp_path, "netfail")
+    with pytest.raises(RunnerError):
+        netting_report("missing-run", ["current_group"], n_random=1, paths=paths, spec=_spec())
+    with pytest.raises(RunnerError):
+        netting_report("netfail", ["../evil"], n_random=1, paths=paths, spec=_spec())
+    with pytest.raises(RunnerError):
+        netting_report("netfail", ["no-such-comp"], n_random=1, paths=paths, spec=_spec())
+    with pytest.raises(RunnerError):
+        netting_report("netfail", ["current_group"], n_random=1, paths=paths, spec=_spec(), pred_col="nope")
+
+
+def test_netting_report_translates_baseline_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.compose.baselines as baselines_mod
+    from src.oibc.compose.constraints import CompositionError
+    from src.oibc.train.runner import netting_report
+
+    _, paths = _netting_run(tmp_path, "nettr")
+    monkeypatch.setattr(
+        baselines_mod, "random_assignment",
+        lambda *a, **k: (_ for _ in ()).throw(CompositionError("boom")),
+    )
+    with pytest.raises(RunnerError):
+        netting_report("nettr", ["current_group"], n_random=1, paths=paths, spec=_spec())
+
+
+def test_netting_report_translates_evaluate_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.evaluate.netting as netting_mod
+    from src.oibc.evaluate.netting import NettingError
+    from src.oibc.train.runner import netting_report
+
+    _, paths = _netting_run(tmp_path, "nettre")
+    monkeypatch.setattr(
+        netting_mod.NettingEvaluator, "evaluate",
+        lambda self, assignment: (_ for _ in ()).throw(NettingError("boom")),
+    )
+    with pytest.raises(RunnerError, match="boom"):
+        netting_report("nettre", ["current_group"], n_random=1, paths=paths, spec=_spec())
+
+
+def test_netting_report_translates_penalties_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.evaluate.netting as netting_mod
+    from src.oibc.evaluate.netting import NettingError
+    from src.oibc.train.runner import netting_report
+
+    _, paths = _netting_run(tmp_path, "nettrp")
+    original = netting_mod.NettingEvaluator.penalties
+
+    def fail_batch(self, assignments):
+        if len(assignments) > 1:
+            raise NettingError("boom")
+        return original(self, assignments)
+
+    monkeypatch.setattr(
+        netting_mod.NettingEvaluator, "penalties",
+        fail_batch,
+    )
+    with pytest.raises(RunnerError, match="boom"):
+        netting_report("nettrp", ["current_group"], n_random=2, paths=paths, spec=_spec())
+
+
+@pytest.mark.parametrize("defect", ["missing_spec", "different_spec", "future_oof", "fractional", "seed"])
+def test_netting_report_reproducibility_guards(tmp_path: Path, defect: str) -> None:
+    from src.oibc.evaluate.registry import read_records
+
+    _, paths = _netting_run(tmp_path, "guard")
+    if defect == "missing_spec":
+        record = read_records(paths.registry)[0]
+        config = {k: v for k, v in record.config.items() if k != "competition"}
+        paths.registry.write_text(record.model_copy(update={"config": config}).model_dump_json() + "\n")
+    elif defect == "future_oof":
+        target = paths.runs / "guard" / "A_oof.parquet"
+        frame = pd.read_parquet(target)
+        frame["ts"] += pd.Timedelta(days=1000)
+        frame["op_date"] = op_date(frame["ts"])
+        frame.to_parquet(target, index=False)
+    kwargs = {"paths": paths, "n_random": 2}
+    if defect == "different_spec":
+        kwargs["spec"] = _spec().model_copy(update={"penalty_rate": 0.2})
+    elif defect == "fractional":
+        kwargs["n_random"] = 1.5
+    elif defect == "seed":
+        kwargs["seed"] = -1
+    with pytest.raises(RunnerError):
+        runner_mod.netting_report("guard", ["current_group"], **kwargs)
+
+
+def test_netting_report_uses_recorded_spec_and_preserves_artifacts(tmp_path: Path) -> None:
+    import json
+
+    _, paths = _netting_run(tmp_path, "recorded")
+    before = {p: p.read_bytes() for p in (paths.runs / "recorded").iterdir()}
+    registry = paths.registry.read_bytes()
+    report = runner_mod.netting_report("recorded", ["current_group"], n_random=1, paths=paths)
+    assert report == json.loads(json.dumps(report, allow_nan=False))
+    assert report == runner_mod.netting_report("recorded", ["current_group"], n_random=1, paths=paths, spec=_spec())
+    assert before == {p: p.read_bytes() for p in (paths.runs / "recorded").iterdir()}
+    assert paths.registry.read_bytes() == registry
+
+
+def test_pipeline_netting_synthetic_roundtrip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+
+    from src.oibc import config, pipeline
+
+    _, paths = _netting_run(tmp_path, "cli-netting")
+    monkeypatch.setattr(config, "ArtifactPaths", lambda: paths)
+    monkeypatch.setattr(runner_mod, "ArtifactPaths", lambda: paths)
+    args = ["report-netting", "--run-id", "cli-netting", "--composition", "current_group",
+            "--composition", "t1", "--n-random", "3", "--seed", "5"]
+    assert pipeline.main(args) == 0
+    output = paths.runs / "cli-netting" / "netting_n3_seed5.json"
+    payload = output.read_bytes()
+    report = json.loads(payload)
+    for fold in ("A", "B"):
+        saved = pd.read_parquet(paths.runs / "cli-netting" / f"{fold}_bag_all.parquet")
+        assert report["folds"][fold]["compositions"]["current_group"]["penalty"] == pytest.approx(
+            saved["penalty"].sum(), rel=1e-9,
+        )
+    with pytest.raises(FileExistsError):
+        pipeline.main(args)
+    assert output.read_bytes() == payload

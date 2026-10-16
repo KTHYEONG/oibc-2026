@@ -8,6 +8,7 @@ import logging
 import re
 import subprocess
 import time
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -803,3 +804,125 @@ def forecast_eval(
     _require(bool(np.isfinite([group_total, site_total]).all()), "forecast: total overflow")
     _require(bool(np.isclose(group_total, site_total, rtol=1e-9, atol=1e-6)), "forecast: group total mismatch")
     return out
+
+
+def _summary_stats(values: np.ndarray) -> dict[str, float]:
+    arr = np.asarray(values, dtype="float64")
+    scale = float(arr.max()) or 1.0
+    return {
+        "mean": float(np.mean(arr / scale) * scale),
+        "sd": float(np.std(arr / scale) * scale),
+        "p05": float(np.percentile(arr, 5)),
+        "p50": float(np.percentile(arr, 50)),
+        "p95": float(np.percentile(arr, 95)),
+    }
+
+
+def netting_report(
+    run_id: str,
+    composition_ids: Sequence[str],
+    *,
+    n_random: int = 200,
+    seed: int = 0,
+    pred_col: str = "pred_bag",
+    paths: ArtifactPaths | None = None,
+    spec: CompetitionSpec | None = None,
+) -> dict[str, object]:
+    """run의 폴드 OOF로 지정 구성·무작위·용량 균형 배정의 벌점 분해를 폴드별로 계산해 반환한다. OOF 누락·구성 위반 시 RunnerError."""
+    from src.oibc.compose.baselines import capacity_balanced_assignment, random_assignment
+    from src.oibc.config import CompetitionSpec as RecordedCompetitionSpec
+    from src.oibc.evaluate.netting import NettingError, NettingEvaluator
+
+    base = paths if paths is not None else ArtifactPaths()
+    _require(
+        isinstance(n_random, int) and not isinstance(n_random, bool) and n_random >= 1,
+        "n_random: must be an integer >= 1",
+    )
+    _require(isinstance(seed, int) and not isinstance(seed, bool) and seed >= 0, "seed: must be a non-negative integer")
+    ids = list(composition_ids)
+    _require(bool(ids) and len(set(ids)) == len(ids), "composition_ids: must be non-empty and distinct")
+    _safe_component(run_id)
+    for comp_id in ids:
+        _safe_component(comp_id)
+    records = read_records(base.registry)
+    match = next((r for r in records if r.run_id == run_id), None)
+    _require(match is not None, f"registry: unknown run_id {run_id!r}")
+    assert match is not None
+    try:
+        spec_data = dict(match.config["competition"])
+        for key in ("train_end", "eval_start", "eval_end"):
+            spec_data[key] = pd.Timestamp(spec_data[key]).tz_convert("Asia/Seoul")
+        recorded = RecordedCompetitionSpec.model_validate(spec_data)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RunnerError("registry: invalid competition spec") from exc
+    comp = spec if spec is not None else recorded
+    _require(comp == recorded, "registry: competition spec mismatch")
+    folds = list(match.folds)
+    _require(bool(folds), "registry: empty folds")
+    sites = _read(DataPaths().canonical_dir / "sites.parquet", ["site_id", "current_group", "capacity_kw"])
+    smp = _resolve_smp(pd.DataFrame(), comp)
+    resolved: dict[str, pd.DataFrame] = {}
+    hashes: dict[str, str] = {}
+    for comp_id in ids:
+        assignment, digest = resolve_composition(comp_id, sites, paths=base, spec=comp)
+        resolved[comp_id] = assignment
+        hashes[comp_id] = digest
+    rng = np.random.default_rng(int(seed))
+    try:
+        random_sets = [random_assignment(sites, rng, spec=comp) for _ in range(int(n_random))]
+        balanced_sets = [capacity_balanced_assignment(sites, rng, spec=comp) for _ in range(int(n_random))]
+    except ValueError as exc:
+        raise RunnerError(str(exc)) from exc
+    fold_out: dict[str, object] = {}
+    for fold in folds:
+        oof = load_oof(run_id, fold, paths=base)
+        _require(not oof.empty and bool((oof["ts"] <= comp.train_end).all()), "oof: empty or evaluation labels forbidden")
+        try:
+            evaluator = NettingEvaluator(oof, smp, pred_col=pred_col, spec=comp)
+        except NettingError as exc:
+            raise RunnerError(str(exc)) from exc
+        comp_results: dict[str, object] = {}
+        comp_penalties: dict[str, float] = {}
+        for comp_id in ids:
+            try:
+                res = evaluator.evaluate(resolved[comp_id])
+            except NettingError as exc:
+                raise RunnerError(f"fold {fold}: {exc}") from exc
+            share = float(res.netting_loss / res.penalty) if res.penalty > 0 else 0.0
+            comp_results[comp_id] = {
+                "penalty": float(res.penalty),
+                "netting_loss": float(res.netting_loss),
+                "netting_share": float(share),
+            }
+            comp_penalties[comp_id] = float(res.penalty)
+        try:
+            random_pen = evaluator.penalties(random_sets)
+            balanced_pen = evaluator.penalties(balanced_sets)
+        except NettingError as exc:
+            raise RunnerError(f"fold {fold}: {exc}") from exc
+        percentiles = {
+            comp_id: float(np.mean(random_pen < comp_penalties[comp_id])) for comp_id in ids
+        }
+        fold_out[fold] = {
+            "pool_penalty": float(evaluator.pool_penalty),
+            "compositions": comp_results,
+            "random": _summary_stats(random_pen),
+            "capacity_balanced": _summary_stats(balanced_pen),
+            "composition_percentile_vs_random": percentiles,
+        }
+        logger.info(
+            "[VPP] netting run=%s fold=%s pool=%r comps=%s random_mean=%r",
+            run_id,
+            fold,
+            float(evaluator.pool_penalty),
+            {k: float(comp_penalties[k]) for k in ids},
+            float(np.mean(random_pen)),
+        )
+    return {
+        "run_id": run_id,
+        "pred_col": pred_col,
+        "n_random": int(n_random),
+        "seed": int(seed),
+        "compositions": dict(hashes),
+        "folds": fold_out,
+    }

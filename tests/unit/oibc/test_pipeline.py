@@ -17,9 +17,10 @@ from src.oibc.train import runner as runner_mod
 
 def test_validate_run_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[object] = []
-    monkeypatch.setattr(runner_mod, "run_validation", lambda cfg: calls.append(cfg))
+    monkeypatch.setattr(runner_mod, "run_validation", lambda cfg, **k: calls.append((cfg, k)))
     assert main(["validate-run", "--run-id", "r1", "--hypothesis", "h"]) == 0
     assert len(calls) == 1
+    assert calls[0][1].get("save_oof", False) is False
     assert main(["validate-run", "--run-id", "r2", "--hypothesis", "h", "--drop-group", "cs", "--weight", "none"]) == 0
     assert len(calls) == 2
 
@@ -321,9 +322,19 @@ def test_pipeline_compose_refuses_existing_id(tmp_path: Path, monkeypatch: pytes
 
 def test_pipeline_validate_run_passes_composition(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[object] = []
-    monkeypatch.setattr(runner_mod, "run_validation", lambda cfg: calls.append(cfg))
+    monkeypatch.setattr(runner_mod, "run_validation", lambda cfg, **k: calls.append(cfg))
     assert main(["validate-run", "--run-id", "r1", "--hypothesis", "h", "--composition", "t1"]) == 0
     assert calls[0].composition_id == "t1"
+
+
+def test_pipeline_validate_run_passes_save_oof(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[object, object]] = []
+    monkeypatch.setattr(runner_mod, "run_validation", lambda cfg, **k: calls.append((cfg, k.get("save_oof"))))
+    assert main(["validate-run", "--run-id", "r1", "--hypothesis", "h", "--save-oof"]) == 0
+    assert calls[0][1] is True
+    calls.clear()
+    assert main(["validate-run", "--run-id", "r2", "--hypothesis", "h"]) == 0
+    assert calls[0][1] is False
 
 
 @pytest.mark.parametrize("defect", ["before", "during", "null"])

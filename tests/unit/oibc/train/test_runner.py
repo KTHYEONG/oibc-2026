@@ -26,6 +26,7 @@ from src.oibc.train.runner import (
     RunnerError,
     forecast_eval,
     load_daily_runs,
+    load_oof,
     reference_assignment,
     run_validation,
     site_frame,
@@ -1355,3 +1356,250 @@ def test_pipeline_submission_composition_roundtrip(
     report = validate.validate_submission(folder / "composition.csv", folder / "forecast.csv", spec=_spec())
     assert report.ok
     assert sum(report.group_forecast_total_kwh.values()) > 0
+
+
+def _oof_seed_cols(seeds: tuple[int, ...]) -> list[str]:
+    return [f"pred_s{s}" for s in seeds]
+
+
+def test_run_validation_default_does_not_write_oof(tmp_path: Path) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    run_validation(_cfg("no-oof"), panel_path=panel, vcfg=_vcfg(), paths=paths)
+    assert list((paths.runs / "no-oof").glob("*_oof.parquet")) == []
+    from src.oibc.evaluate.registry import read_records
+
+    rec = next(r for r in read_records(paths.registry) if r.run_id == "no-oof")
+    assert rec.config["oof_saved"] is False
+    daily = sorted(p.name for p in (paths.runs / "no-oof").glob("*.parquet"))
+    assert daily == sorted(
+        f"{f}_{tag}_{s}.parquet"
+        for f in ("A", "B") for tag in ("s0", "s1", "bag") for s in ("all", "warm")
+    )
+
+
+def test_run_validation_save_oof_schema(tmp_path: Path) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+    run_validation(_cfg("oof1"), panel_path=panel, vcfg=vcfg, paths=paths, save_oof=True)
+    seeds = (0, 1)
+    want_cols = ["site_id", "ts", "op_date", "actual_kwh", *_oof_seed_cols(seeds), "pred_bag", "is_warm"]
+    for fold in ("A", "B"):
+        frame = pd.read_parquet(paths.runs / "oof1" / f"{fold}_oof.parquet")
+        assert frame.columns.tolist() == want_cols
+        assert str(frame["site_id"].dtype) == "string"
+        assert str(frame["ts"].dtype) == _DT
+        assert str(frame["op_date"].dtype) == _DT
+        assert all(str(frame[c].dtype) == "float64" for c in ["actual_kwh", *want_cols[4:-1]])
+        assert str(frame["is_warm"].dtype) == "bool"
+        assert not frame.duplicated(subset=["site_id", "ts"]).any()
+        ordered = frame.sort_values(["site_id", "ts"], kind="mergesort").reset_index(drop=True)
+        pd.testing.assert_frame_equal(frame, ordered)
+
+
+def test_run_validation_oof_conserves_daily_settlement(tmp_path: Path) -> None:
+    from src.oibc.evaluate.settlement import aggregate_groups, daily_totals, settle
+
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+    run_validation(_cfg("oof2"), panel_path=panel, vcfg=vcfg, paths=paths, save_oof=True)
+    sites = pd.read_parquet(tmp_path / "canonical" / "sites.parquet")
+    assignment = reference_assignment(sites)
+    smp = pd.read_parquet(tmp_path / "canonical" / "smp.parquet")
+    for fold in ("A", "B"):
+        oof = load_oof("oof2", fold, paths=paths)
+        tag_of = {f"pred_s{s}": f"s{s}" for s in (0, 1)} | {"pred_bag": "bag"}
+        for col, tag in tag_of.items():
+            site = oof[["site_id", "ts"]].assign(
+                pred_kwh=oof[col].to_numpy(dtype="float64"),
+                actual_kwh=oof["actual_kwh"].to_numpy(dtype="float64"),
+            )
+            daily = daily_totals(settle(aggregate_groups(site, assignment, spec=_spec()), smp, spec=_spec()))
+            saved = runner_mod._normalize_daily(
+                pd.read_parquet(paths.runs / "oof2" / f"{fold}_{tag}_all.parquet"), "x",
+            )
+            np.testing.assert_allclose(daily["penalty"], saved["penalty"], rtol=1e-12)
+            np.testing.assert_allclose(daily["revenue"], saved["revenue"], rtol=1e-12)
+
+
+def test_run_validation_oof_night_rows_zero(tmp_path: Path) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    run_validation(_cfg("oof3"), panel_path=panel, vcfg=_vcfg(), paths=paths, save_oof=True)
+    for fold in ("A", "B"):
+        oof = load_oof("oof3", fold, paths=paths)
+        night = oof.loc[~oof["ts"].dt.hour.isin([11, 12, 13])]
+        assert len(night) > 0
+        assert bool((oof.loc[oof["ts"].dt.hour.eq(1), [c for c in oof.columns if c.startswith("pred_")]] == 0.0).all().all())
+
+
+def _make_cold_panel(tmp_path: Path) -> Path:
+    panel_path = _make_panel(tmp_path)
+    cutoff = pd.Timestamp("2023-01-09", tz=KST)
+    panel = pd.read_parquet(panel_path)
+    panel.loc[~((panel["site_id"] == "PV004") & (panel["op_date"] < cutoff))].to_parquet(panel_path, index=False)
+    for name in ("generation", "solar"):
+        path = tmp_path / ("canonical" if name == "generation" else "derived") / f"{name}.parquet"
+        frame = pd.read_parquet(path)
+        if "site_id" in frame.columns and "ts" in frame.columns:
+            frame.loc[~((frame["site_id"] == "PV004") & (frame["ts"] < cutoff))].to_parquet(path, index=False)
+    return panel_path
+
+
+def test_run_validation_oof_warm_flag_matches_warm_subset(tmp_path: Path) -> None:
+    from src.oibc.evaluate.settlement import aggregate_groups, daily_totals, settle
+
+    panel = _make_cold_panel(tmp_path)
+    paths = _paths(tmp_path)
+    run_validation(_cfg("oof4"), panel_path=panel, vcfg=_vcfg(), paths=paths, save_oof=True)
+    sites = pd.read_parquet(tmp_path / "canonical" / "sites.parquet")
+    assignment = reference_assignment(sites)
+    smp = pd.read_parquet(tmp_path / "canonical" / "smp.parquet")
+    oof_a = load_oof("oof4", "A", paths=paths)
+    assert set(oof_a.loc[oof_a["site_id"] == "PV004", "is_warm"]) == {False}
+    assert set(oof_a.loc[oof_a["site_id"] != "PV004", "is_warm"]) == {True}
+    for fold in ("A", "B"):
+        oof = load_oof("oof4", fold, paths=paths)
+        warm = oof.loc[oof["is_warm"]].reset_index(drop=True)
+        assert len(warm) < len(oof) if fold == "A" else len(warm) == len(oof)
+        site = warm[["site_id", "ts"]].assign(
+            pred_kwh=warm["pred_bag"].to_numpy(dtype="float64"),
+            actual_kwh=warm["actual_kwh"].to_numpy(dtype="float64"),
+        )
+        daily = daily_totals(settle(aggregate_groups(site, assignment, spec=_spec()), smp, spec=_spec()))
+        saved = runner_mod._normalize_daily(
+            pd.read_parquet(paths.runs / "oof4" / f"{fold}_bag_warm.parquet"), "x",
+        )
+        np.testing.assert_allclose(daily["penalty"], saved["penalty"], rtol=1e-12)
+        np.testing.assert_allclose(daily["revenue"], saved["revenue"], rtol=1e-12)
+
+
+def test_run_validation_save_oof_not_in_config_diff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+    _clean_git(monkeypatch)
+    run_validation(_cfg("base"), panel_path=panel, vcfg=vcfg, paths=paths)
+    rec = run_validation(_cfg("cand", baseline_run_id="base"), panel_path=panel, vcfg=vcfg, paths=paths, save_oof=True)
+    assert (rec.comparison or {})["config_diff"] == []
+
+
+def test_run_validation_refactor_preserves_daily_outputs(tmp_path: Path) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+    run_validation(_cfg("plain"), panel_path=panel, vcfg=vcfg, paths=paths, save_oof=False)
+    run_validation(_cfg("with-oof"), panel_path=panel, vcfg=vcfg, paths=paths, save_oof=True)
+    for fold in ("A", "B"):
+        for tag in ("s0", "s1", "bag"):
+            for subset in ("all", "warm"):
+                name = f"{fold}_{tag}_{subset}.parquet"
+                left = runner_mod._normalize_daily(pd.read_parquet(paths.runs / "plain" / name), "x")
+                right = runner_mod._normalize_daily(pd.read_parquet(paths.runs / "with-oof" / name), "x")
+                pd.testing.assert_frame_equal(left, right)
+
+
+def test_load_oof_roundtrip(tmp_path: Path) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    run_validation(_cfg("oof5"), panel_path=panel, vcfg=_vcfg(), paths=paths, save_oof=True)
+    for fold in ("A", "B"):
+        pd.testing.assert_frame_equal(
+            load_oof("oof5", fold, paths=paths),
+            pd.read_parquet(paths.runs / "oof5" / f"{fold}_oof.parquet"),
+        )
+
+
+def test_load_oof_missing_file_fails_closed(tmp_path: Path) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    run_validation(_cfg("oof6"), panel_path=panel, vcfg=_vcfg(), paths=paths)
+    with pytest.raises(RunnerError, match="--save-oof"):
+        load_oof("oof6", "A", paths=paths)
+
+
+def test_load_oof_rejects_unsafe_component(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    with pytest.raises(RunnerError):
+        load_oof("../x", "A", paths=paths)
+
+
+def test_load_oof_rejects_negative_prediction(tmp_path: Path) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    run_validation(_cfg("oof7"), panel_path=panel, vcfg=_vcfg(), paths=paths, save_oof=True)
+    target = paths.runs / "oof7" / "A_oof.parquet"
+    frame = pd.read_parquet(target)
+    frame.loc[frame.index[0], "pred_s0"] = -1.0
+    frame.to_parquet(target, index=False)
+    with pytest.raises(RunnerError):
+        load_oof("oof7", "A", paths=paths)
+
+
+@pytest.mark.parametrize("defect", ["unreadable", "columns", "seeds", "duplicate", "hour", "actual"])
+def test_load_oof_rejects_corrupt_files(tmp_path: Path, defect: str) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    run_validation(_cfg("oof8"), panel_path=panel, vcfg=_vcfg(), paths=paths, save_oof=True)
+    target = paths.runs / "oof8" / "A_oof.parquet"
+    if defect == "unreadable":
+        target.write_bytes(b"not a parquet file")
+    else:
+        frame = pd.read_parquet(target)
+        if defect == "columns":
+            frame = frame.drop(columns=["pred_bag"])
+        elif defect == "seeds":
+            frame = frame.drop(columns=[c for c in frame.columns if c.startswith("pred_s")])
+        elif defect == "duplicate":
+            frame = pd.concat([frame, frame.iloc[:1]], ignore_index=True)
+        elif defect == "hour":
+            bad = frame.copy()
+            bad["ts"] = pd.Series(
+                pd.DatetimeIndex(bad["ts"]) + pd.to_timedelta(range(len(bad)), unit="m")
+            )
+            frame = bad
+        else:
+            frame.loc[frame.index[0], "actual_kwh"] = float("nan")
+        frame.to_parquet(target, index=False)
+    with pytest.raises(RunnerError):
+        load_oof("oof8", "A", paths=paths)
+
+
+@pytest.mark.parametrize("defect", [None, "warm_string", "warm_null", "date", "date_dtype", "numeric", "site"])
+def test_load_oof_preserves_schema_and_row_pairing(tmp_path: Path, defect: str | None) -> None:
+    paths = _paths(tmp_path)
+    folder = paths.runs / "schema"
+    folder.mkdir(parents=True)
+    ts = pd.Series(pd.DatetimeIndex(["2023-01-11 00:00", "2023-01-10 11:00"], tz=KST), dtype=_DT)
+    frame = pd.DataFrame({
+        "site_id": pd.Series(["PV002", "PV001"], dtype="string"),
+        "ts": ts,
+        "op_date": op_date(ts).astype(_DT),
+        "actual_kwh": [2.0, 4.0],
+        "pred_s1": [3.0, 5.0],
+        "pred_s0": [1.0, 6.0],
+        "pred_bag": [2.0, 5.5],
+        "is_warm": [True, False],
+    })
+    if defect == "warm_string":
+        frame["is_warm"] = ["False", "True"]
+    elif defect == "warm_null":
+        frame["is_warm"] = pd.Series([True, pd.NA], dtype="boolean")
+    elif defect == "date":
+        frame.loc[0, "op_date"] += pd.Timedelta(days=1)
+    elif defect == "date_dtype":
+        frame["op_date"] = frame["op_date"].astype("str")
+    elif defect == "numeric":
+        frame["pred_bag"] = frame["pred_bag"].astype("str")
+    elif defect == "site":
+        frame["site_id"] = [1, 2]
+    frame.index = [9, 3]
+    frame.to_parquet(folder / "A_oof.parquet")
+    if defect is not None:
+        with pytest.raises(RunnerError, match=r"schema|op_date"):
+            load_oof("schema", "A", paths=paths)
+    else:
+        expected = frame.sort_values(["site_id", "ts"]).reset_index(drop=True)
+        pd.testing.assert_frame_equal(load_oof("schema", "A", paths=paths), expected)

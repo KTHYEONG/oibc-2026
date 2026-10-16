@@ -12,6 +12,134 @@ from src.oibc.features import panel as panel_mod
 from src.oibc.pipeline import main
 from src.oibc.submit import validate as validate_mod
 from src.oibc.submit.validate import load_reference
+from src.oibc.train import runner as runner_mod
+
+
+def test_validate_run_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(runner_mod, "run_validation", lambda cfg: calls.append(cfg))
+    assert main(["validate-run", "--run-id", "r1", "--hypothesis", "h"]) == 0
+    assert len(calls) == 1
+    assert main(["validate-run", "--run-id", "r2", "--hypothesis", "h", "--drop-group", "cs", "--weight", "none"]) == 0
+    assert len(calls) == 2
+
+
+def test_submit_unknown_run_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.evaluate import registry as registry_mod
+
+    monkeypatch.setattr(registry_mod, "read_records", lambda *a, **k: [])
+    with pytest.raises(runner_mod.RunnerError, match="unknown run_id"):
+        main(["submit", "--run-id", "nope", "--sub-id", "s1"])
+
+
+def test_submit_missing_bag_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import UTC, datetime
+
+    from src.oibc.evaluate import registry as registry_mod
+    from src.oibc.evaluate.registry import ExperimentRecord
+
+    rec = ExperimentRecord(
+        run_id="r1",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        hypothesis="h",
+        config={},
+        git_commit=None,
+        seeds=(0,),
+        folds=("A",),
+        metrics={"A/0": {"W": 1.0}},
+        comparison={},
+    )
+    monkeypatch.setattr(registry_mod, "read_records", lambda *a, **k: [rec])
+    with pytest.raises(runner_mod.RunnerError, match="bag"):
+        main(["submit", "--run-id", "r1", "--sub-id", "s1"])
+
+
+def test_submit_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import hashlib
+    from datetime import UTC, datetime
+
+    import pandas as pd
+
+    from src.oibc.evaluate import registry as registry_mod
+    from src.oibc.evaluate.registry import ExperimentRecord
+    from src.oibc.submit import build as build_mod
+    from src.oibc.config import FeatureConfig, ModelConfig, RunConfig
+
+    panel_path = tmp_path / "panel.parquet"
+    panel_path.write_bytes(b"validated panel")
+    cfg = RunConfig(run_id="r1", hypothesis="h", features=FeatureConfig(groups=frozenset()), model=ModelConfig(seeds=(0,), weight="none"))
+    config = cfg.model_dump(mode="json") | {
+        "panel_path": str(panel_path), "panel_sha256": hashlib.sha256(panel_path.read_bytes()).hexdigest(),
+        "competition": CompetitionSpec().model_dump(mode="json"),
+    }
+
+    rec = ExperimentRecord(
+        run_id="r1",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        hypothesis="h",
+        config=config,
+        git_commit=None,
+        seeds=(0,),
+        folds=("A",),
+        metrics={"A/0": {"W": 1.0}},
+        comparison={"bag": {"A": {"W_all": 5.0, "W_warm": 2.0}}},
+    )
+    monkeypatch.setattr(registry_mod, "read_records", lambda *a, **k: [rec])
+    monkeypatch.setattr(pd, "read_parquet", lambda *a, **k: pd.DataFrame({"site_id": ["s"], "current_group": ["A"]}))
+    def predict(actual_cfg, **kwargs):
+        assert actual_cfg == cfg
+        assert kwargs["panel_path"] == panel_path
+        return pd.DataFrame({"group": ["G1"], "ts": [pd.Timestamp("2025-06-01 01:00", tz="Asia/Seoul")], "forecast_kwh": [1.0]})
+
+    monkeypatch.setattr(runner_mod, "forecast_eval", predict)
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: calls.append((a, k)))
+    assert main(["submit", "--run-id", "r1", "--sub-id", "s1"]) == 0
+    assert len(calls) == 1
+    assert calls[0][1]["local_metrics"] == {"W_all": 5.0, "W_warm": 2.0}
+
+
+@pytest.mark.parametrize("defect", ["config", "hash", "seeds", "bag_folds", "metrics", "negative"])
+def test_submit_rejects_changed_or_incomplete_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str) -> None:
+    import hashlib
+    from datetime import UTC, datetime
+
+    from src.oibc.config import ModelConfig, RunConfig
+    from src.oibc.evaluate import registry as registry_mod
+    from src.oibc.evaluate.registry import ExperimentRecord
+
+    panel = tmp_path / "validated.parquet"
+    panel.write_bytes(b"panel")
+    cfg = RunConfig(run_id="r1", hypothesis="h", model=ModelConfig(seeds=(0,)))
+    config = cfg.model_dump(mode="json") | {
+        "panel_path": str(panel), "panel_sha256": hashlib.sha256(panel.read_bytes()).hexdigest(),
+        "competition": CompetitionSpec().model_dump(mode="json"),
+    }
+    bag = {"A": {"W_all": 1.0, "W_warm": 0.5}}
+    if defect == "config":
+        config = {}
+    elif defect == "hash":
+        panel.write_bytes(b"changed")
+    elif defect == "seeds":
+        config["model"]["seeds"] = [1]
+    elif defect == "bag_folds":
+        bag = {"B": {"W_all": 1.0, "W_warm": 0.5}}
+    elif defect == "metrics":
+        bag["A"] = {"W_all": 1.0}
+    else:
+        bag["A"]["W_all"] = -1.0
+    rec = ExperimentRecord(
+        run_id="r1", created_at=datetime.now(UTC), hypothesis="h", config=config,
+        git_commit=None, seeds=(0,), folds=("A",), metrics={"A/0": {"W": 1.0}}, comparison={"bag": bag},
+    )
+    monkeypatch.setattr(registry_mod, "read_records", lambda: [rec])
+
+    def no_forecast(*args, **kwargs):
+        pytest.fail("재현 정보 검증 전에 예측 실행")
+
+    monkeypatch.setattr(runner_mod, "forecast_eval", no_forecast)
+    with pytest.raises(runner_mod.RunnerError):
+        main(["submit", "--run-id", "r1", "--sub-id", "s1"])
 
 
 def test_unknown_subcommand_exits_with_usage_error() -> None:

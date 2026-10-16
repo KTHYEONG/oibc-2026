@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from itertools import pairwise
 from math import isfinite
 from pathlib import Path
@@ -265,6 +266,7 @@ class ArtifactPaths(BaseModel):
     root: Path = repo_root() / "artifacts"
     registry: Path = repo_root() / "artifacts" / "registry.jsonl"
     submissions: Path = repo_root() / "artifacts" / "submissions"
+    runs: Path = repo_root() / "artifacts" / "runs"
 
 
 class ModelConfig(BaseModel):
@@ -313,3 +315,33 @@ class ModelConfig(BaseModel):
         if self.min_weight <= 0.0:
             raise ValueError("min_weight must be > 0")
         return self
+
+
+_RUN_ID = re.compile(r"[A-Za-z0-9_.-]+")
+
+
+class RunConfig(BaseModel):
+    """실험 1회의 식별자·가설·특성·모델 설정."""
+
+    model_config = ConfigDict(frozen=True)
+
+    run_id: str
+    hypothesis: str
+    features: FeatureConfig = FeatureConfig()
+    model: ModelConfig = ModelConfig()
+    baseline_run_id: str | None = None
+    note: str = ""
+
+    @field_validator("run_id", "baseline_run_id")
+    @classmethod
+    def _check_run_id(cls, v: str | None) -> str | None:
+        if v is not None and (not v or v in {".", ".."} or _RUN_ID.fullmatch(v) is None):
+            raise ValueError("run_id must match [A-Za-z0-9_.-]+")
+        return v
+
+    @field_validator("hypothesis")
+    @classmethod
+    def _check_hypothesis(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("hypothesis must be non-empty")
+        return v

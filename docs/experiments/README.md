@@ -18,3 +18,8 @@ scratch 결과는 이 디렉터리에 기록되기 전까지 근거로 쓰지 �
 - `[재현]`: registry run_id 또는 운영 CLI 명령으로 다시 만들 수 있음.
 - `[registry]`: registry 기록만 있음.
 - `[탐색]`: scratch에서 측정했고 코드는 폐기됨. 수치만 남음.
+
+## 문서 정비 범위
+
+`docs/architecture/overview.md`의 계획 단계 compose 모듈 목록과 잔차 기반 탐색 서술은
+별도 문서 정비 작업의 대상이다.

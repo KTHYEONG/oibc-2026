@@ -46,6 +46,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     val.add_argument("--drop-group", action="append", choices=sorted(FeatureConfig().groups), default=[])
     val.add_argument("--weight", choices=["smp_k_cap", "k_cap", "none"], default="smp_k_cap")
     val.add_argument("--allow-commit-drift", action="store_true")
+    val.add_argument("--save-oof", action="store_true")
     comp_cmd = sub.add_parser("compose")
     comp_cmd.add_argument("--comp-id", required=True)
     sub_cmd = sub.add_parser("submit")
@@ -79,7 +80,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 features=FeatureConfig(groups=frozenset(groups)),
                 model=ModelConfig(weight=args.weight),
                 allow_commit_drift=args.allow_commit_drift,
-            )
+            ),
+            save_oof=args.save_oof,
         )
     elif args.command == "compose":
         import pandas as pd

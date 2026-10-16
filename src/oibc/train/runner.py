@@ -138,6 +138,75 @@ def site_frame(day_rows: pd.DataFrame, day_pred_kwh: np.ndarray, night_rows: pd.
     return out.sort_values(["site_id", "ts"], kind="mergesort").reset_index(drop=True)
 
 
+def _settle_subset(
+    test_day: pd.DataFrame,
+    night_fold: pd.DataFrame,
+    pred: np.ndarray,
+    sel_day: np.ndarray,
+    sel_night: np.ndarray,
+    assignment: pd.DataFrame,
+    smp: pd.DataFrame,
+    comp: CompetitionSpec,
+    *,
+    fold_name: str,
+    subset: str,
+) -> pd.DataFrame:
+    """선택 마스크를 적용해 일별 정산을 계산한다."""
+    day_part = test_day.loc[sel_day].reset_index(drop=True)
+    night_part = night_fold.loc[sel_night].reset_index(drop=True)
+    if len(day_part) + len(night_part) == 0:
+        raise RunnerError(f"fold {fold_name}: empty {subset}")
+    frame = site_frame(day_part, np.asarray(pred, dtype="float64")[sel_day], night_part)
+    grouped = aggregate_groups(frame, assignment, spec=comp)
+    return daily_totals(settle(grouped, smp, spec=comp))
+
+
+def load_oof(run_id: str, fold: str, *, paths: ArtifactPaths | None = None) -> pd.DataFrame:
+    """저장된 폴드 OOF를 스키마 검증 후 반환한다. 파일 누락·스키마·키·값 위반 시 RunnerError."""
+    _safe_component(run_id)
+    _safe_component(fold)
+    base = paths if paths is not None else ArtifactPaths()
+    path = base.runs / run_id / f"{fold}_oof.parquet"
+    if not path.exists():
+        raise RunnerError(f"oof: missing {path.name} (run={run_id} fold={fold}); re-run with --save-oof")
+    try:
+        frame = pd.read_parquet(path)
+    except (OSError, ValueError) as exc:
+        raise RunnerError(f"oof: unreadable ({exc})") from exc
+    required = ["site_id", "ts", "op_date", "actual_kwh", "pred_bag", "is_warm"]
+    if frame.columns.has_duplicates or not set(required) <= set(frame.columns):
+        raise RunnerError("oof: missing columns")
+    seed_cols = [c for c in frame.columns if re.fullmatch(r"pred_s-?\d+", str(c))]
+    if not seed_cols:
+        raise RunnerError("oof: missing pred_s columns")
+    numeric_cols = ["actual_kwh", *seed_cols, "pred_bag"]
+    expected = ["site_id", "ts", "op_date", "actual_kwh", *seed_cols, "pred_bag", "is_warm"]
+    if (
+        frame.columns.tolist() != expected
+        or not isinstance(frame["site_id"].dtype, pd.StringDtype)
+        or any(str(frame[c].dtype) != _DT for c in ("ts", "op_date"))
+        or any(str(frame[c].dtype) != "float64" for c in numeric_cols)
+        or str(frame["is_warm"].dtype) != "bool"
+    ):
+        raise RunnerError("oof: invalid schema")
+    if frame[["site_id", "ts"]].isna().any().any() or frame.duplicated(subset=["site_id", "ts"]).any():
+        raise RunnerError("oof: duplicate key (site_id, ts)")
+    try:
+        require_hourly_kst(frame["ts"], "ts")
+    except ValueError as exc:
+        raise RunnerError(str(exc)) from exc
+    if not frame["op_date"].eq(op_date(frame["ts"])).all():
+        raise RunnerError("oof: inconsistent op_date")
+    actual = frame["actual_kwh"].to_numpy()
+    if not np.all(np.isfinite(actual)):
+        raise RunnerError("oof: actual_kwh must be finite")
+    for col in [*seed_cols, "pred_bag"]:
+        vals = frame[col].to_numpy()
+        if not np.all(np.isfinite(vals)) or bool((vals < 0).any()):
+            raise RunnerError(f"oof: {col} must be finite and >= 0")
+    return frame.sort_values(["site_id", "ts"], kind="mergesort").reset_index(drop=True)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as fh:
@@ -433,8 +502,9 @@ def run_validation(
     vcfg: ValidationConfig | None = None,
     paths: ArtifactPaths | None = None,
     spec: CompetitionSpec | None = None,
+    save_oof: bool = False,
 ) -> ExperimentRecord:
-    """폴드별 시드 검증을 수행해 일별 정산을 저장하고 registry에 기록한 레코드를 반환한다."""
+    """폴드별 시드 검증을 수행해 일별 정산(선택 시 발전소 단위 OOF)을 저장하고 registry에 기록한 레코드를 반환한다."""
     base = paths if paths is not None else ArtifactPaths()
     val = vcfg if vcfg is not None else ValidationConfig()
     comp = spec if spec is not None else CompetitionSpec()
@@ -517,14 +587,10 @@ def run_validation(
                 sel_night = (
                     np.ones(len(night_fold), dtype=bool) if subset == "all" else warm_night
                 )
-                day_part = test_day.loc[sel_day].reset_index(drop=True)
-                night_part = night_fold.loc[sel_night].reset_index(drop=True)
-                if len(day_part) + len(night_part) == 0:
-                    raise RunnerError(f"fold {fold.name}: empty {subset}")
-                frame = site_frame(day_part, preds[idx][sel_day], night_part)
-                grouped = aggregate_groups(frame, assignment, spec=comp)
-                result = settle(grouped, smp, spec=comp)
-                daily = daily_totals(result)
+                daily = _settle_subset(
+                    test_day, night_fold, preds[idx], sel_day, sel_night,
+                    assignment, smp, comp, fold_name=fold.name, subset=subset,
+                )
                 daily.to_parquet(run_dir / f"{fold.name}_s{seed}_{subset}.parquet")
                 if subset == "all":
                     metrics[f"{fold.name}/{seed}"] = {
@@ -547,14 +613,10 @@ def run_validation(
         for subset in ("all", "warm"):
             sel_day = np.ones(len(test_day), dtype=bool) if subset == "all" else warm_day
             sel_night = np.ones(len(night_fold), dtype=bool) if subset == "all" else warm_night
-            frame = site_frame(
-                test_day.loc[sel_day].reset_index(drop=True),
-                bag_pred[sel_day],
-                night_fold.loc[sel_night].reset_index(drop=True),
+            daily = _settle_subset(
+                test_day, night_fold, bag_pred, sel_day, sel_night,
+                assignment, smp, comp, fold_name=fold.name, subset=subset,
             )
-            grouped = aggregate_groups(frame, assignment, spec=comp)
-            result = settle(grouped, smp, spec=comp)
-            daily = daily_totals(result)
             daily.to_parquet(run_dir / f"{fold.name}_bag_{subset}.parquet")
             entry = bag_w.setdefault(fold.name, {})
             entry[f"W_{subset}"] = float(daily["penalty"].sum())
@@ -565,6 +627,74 @@ def run_validation(
             bag_w[fold.name]["W_all"],
             bag_w[fold.name]["W_warm"],
         )
+        if save_oof:
+            day_col = _actual_col(test_day) if len(test_day) else "energy"
+            night_col = _actual_col(night_fold) if len(night_fold) else "energy"
+            day_actual = (
+                pd.to_numeric(test_day[day_col], errors="coerce").to_numpy(dtype="float64")
+                if len(test_day)
+                else np.empty(0, dtype="float64")
+            )
+            night_actual = (
+                pd.to_numeric(night_fold[night_col], errors="coerce").to_numpy(dtype="float64")
+                if len(night_fold)
+                else np.empty(0, dtype="float64")
+            )
+            seed_cols = [f"pred_s{s}" for s in cfg.model.seeds]
+            oof = pd.DataFrame(
+                {
+                    "site_id": pd.Series(
+                        test_day["site_id"].astype("string").tolist()
+                        + night_fold["site_id"].astype("string").tolist(),
+                        dtype="string",
+                    ),
+                    "ts": pd.Series(
+                        pd.DatetimeIndex(
+                            test_day["ts"].tolist() + night_fold["ts"].tolist()
+                        ),
+                        dtype=_DT,
+                    ),
+                    "op_date": pd.Series(
+                        pd.DatetimeIndex(
+                            test_day["op_date"].tolist() + night_fold["op_date"].tolist()
+                        ),
+                        dtype=_DT,
+                    ),
+                    "actual_kwh": pd.Series(
+                        np.concatenate([day_actual, night_actual]), dtype="float64"
+                    ),
+                    **{
+                        name: pd.Series(
+                            np.concatenate(
+                                [np.asarray(preds[idx], dtype="float64"),
+                                 np.zeros(len(night_fold), dtype="float64")]
+                            ),
+                            dtype="float64",
+                        )
+                        for idx, name in enumerate(seed_cols)
+                    },
+                    "pred_bag": pd.Series(
+                        np.concatenate(
+                            [np.asarray(bag_pred, dtype="float64"),
+                             np.zeros(len(night_fold), dtype="float64")]
+                        ),
+                        dtype="float64",
+                    ),
+                    "is_warm": pd.Series(
+                        test_day["site_id"].astype("string").isin(warm_ids).tolist()
+                        + night_fold["site_id"].astype("string").isin(warm_ids).tolist(),
+                        dtype="bool",
+                    ),
+                }
+            )
+            oof = oof[["site_id", "ts", "op_date", "actual_kwh", *seed_cols, "pred_bag", "is_warm"]]
+            oof = oof.sort_values(["site_id", "ts"], kind="mergesort").reset_index(drop=True)
+            oof.to_parquet(run_dir / f"{fold.name}_oof.parquet", index=False)
+            logger.info(
+                "[DATA] run=%s fold=%s oof rows=%d sites=%d",
+                cfg.run_id, fold.name, len(oof), int(oof["site_id"].nunique()),
+            )
+            del oof
         del models, preds, bag_pred, train_fold, test_day
         gc.collect()
     comparison: dict[str, object] = {"bag": bag_w, "config_diff": config_diff}
@@ -579,6 +709,7 @@ def run_validation(
         }
     config = dict(cfg.model_dump(mode="json"))
     config["composition_sha256"] = comp_sha
+    config["oof_saved"] = bool(save_oof)
     if _sha256(panel_file) != panel_hash:
         raise RunnerError("panel: changed during validation")
     config["panel_path"] = str(panel_file.resolve())

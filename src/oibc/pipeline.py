@@ -8,8 +8,9 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
-from src.oibc.config import CompetitionSpec, DataPaths, QualityConfig
+from src.oibc.config import CompetitionSpec, DataPaths, FeatureConfig, QualityConfig
 from src.oibc.data import derived, ingest
+from src.oibc.features import panel as features_panel
 from src.oibc.submit.validate import validate_submission
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("ingest")
     sub.add_parser("derive")
+    sub.add_parser("features")
     validate_cmd = sub.add_parser("validate-submission")
     validate_cmd.add_argument("--composition", type=Path, required=True)
     validate_cmd.add_argument("--forecast", type=Path, required=True)
@@ -33,6 +35,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ingest.build_canonical(DataPaths(), CompetitionSpec(), QualityConfig())
     elif args.command == "derive":
         derived.build_derived(DataPaths(), CompetitionSpec())
+    elif args.command == "features":
+        features_panel.build_features(DataPaths(), CompetitionSpec(), FeatureConfig())
     elif args.command == "validate-submission":
         report = validate_submission(args.composition, args.forecast)
         for warn in report.warnings:

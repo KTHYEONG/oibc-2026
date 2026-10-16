@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from itertools import pairwise
+from math import isfinite
 from pathlib import Path
 from typing import Literal
 
@@ -90,6 +91,80 @@ class DataPaths(BaseModel):
     raw_dir: Path = repo_root() / "data" / "raw" / "01_participant_dataset"
     canonical_dir: Path = repo_root() / "data" / "canonical"
     derived_dir: Path = repo_root() / "data" / "derived"
+    features_dir: Path = repo_root() / "data" / "features"
+
+
+class FeatureConfig(BaseModel):
+    """특성 묶음·변수 목록·발행 내 변환 파라미터."""
+
+    model_config = ConfigDict(frozen=True)
+
+    groups: frozenset[Literal["cs", "rd", "day", "fleet"]] = frozenset({"cs", "rd", "day", "fleet"})
+    day_min_elev_deg: float = 0.0
+    wa_vars: tuple[str, ...] = ("wa_cloud", "wa_temp", "wa_humidity", "wa_rain", "wa_snow", "wa_wind_speed", "wa_ground_press")
+    wb_vars: tuple[str, ...] = ("wb_cloud", "wb_temp", "wb_rel_hum", "wb_uv_idx", "wb_precip_prob", "wb_total_liq", "wb_vis", "wb_wind_speed", "wb_dew_point", "wb_ceiling", "wb_snow")
+    neighbor_vars: tuple[str, ...] = ("wa_cloud", "wb_cloud", "wb_uv_idx")
+    neighbor_offsets: tuple[int, ...] = (-1, 1)
+    rd_vars: tuple[str, ...] = ("wa_cloud", "wb_cloud", "wb_uv_idx", "wb_precip_prob", "wa_rain")
+    day_round: int = 17
+    day_shift_offsets: tuple[int, ...] = (-2, 2)
+    day_roll_window: int = 3
+    day_hours: tuple[int, int] = (9, 16)
+    day_mean_vars: tuple[str, ...] = ("wa_cloud", "wb_cloud", "wb_precip_prob")
+    day_max_vars: tuple[str, ...] = ("wb_uv_idx",)
+    day_sum_vars: tuple[str, ...] = ("wa_rain", "wb_total_liq")
+    fleet_vars: tuple[str, ...] = ("wa_cloud", "wb_cloud", "wb_precip_prob", "wb_uv_idx")
+    vsfleet_vars: tuple[str, ...] = ("wa_cloud", "wb_cloud", "wb_uv_idx")
+
+    @model_validator(mode="after")
+    def _check_features(self) -> FeatureConfig:
+        pools = (*self.wa_vars, *self.wb_vars)
+        for name in pools:
+            if not (name.startswith("wa_") or name.startswith("wb_")):
+                raise ValueError(f"variable without provider prefix: {name!r}")
+        if not all(v.startswith("wa_") for v in self.wa_vars) or not all(v.startswith("wb_") for v in self.wb_vars):
+            raise ValueError("wa_vars/wb_vars: provider prefix mismatch")
+        wa = set(self.wa_vars)
+        wb = set(self.wb_vars)
+        if len(wa) != len(self.wa_vars) or len(wb) != len(self.wb_vars):
+            raise ValueError("wa_vars/wb_vars must not contain duplicates")
+        if "wa_cloud" not in wa or not {"wb_cloud", "wb_uv_idx"} <= wb:
+            raise ValueError("wa_vars/wb_vars: clear-sky inputs required")
+        if not isfinite(self.day_min_elev_deg):
+            raise ValueError("day_min_elev_deg must be finite")
+        for label, subset in (
+            ("neighbor_vars", self.neighbor_vars),
+            ("rd_vars", self.rd_vars),
+            ("day_mean_vars", self.day_mean_vars),
+            ("day_max_vars", self.day_max_vars),
+            ("day_sum_vars", self.day_sum_vars),
+            ("fleet_vars", self.fleet_vars),
+        ):
+            for name in subset:
+                if name.startswith("wa_"):
+                    if name not in wa:
+                        raise ValueError(f"{label}: {name!r} not in wa_vars")
+                elif name.startswith("wb_"):
+                    if name not in wb:
+                        raise ValueError(f"{label}: {name!r} not in wb_vars")
+                else:
+                    raise ValueError(f"{label}: {name!r} without provider prefix")
+        for name in self.vsfleet_vars:
+            if name not in set(self.fleet_vars):
+                raise ValueError(f"vsfleet_vars: {name!r} not in fleet_vars")
+        if self.day_round not in CompetitionSpec().rounds:
+            raise ValueError("day_round must be a valid issuance round")
+        for label, offsets in (("neighbor_offsets", self.neighbor_offsets), ("day_shift_offsets", self.day_shift_offsets)):
+            if 0 in offsets:
+                raise ValueError(f"{label} must not contain 0")
+            if len(set(offsets)) != len(offsets):
+                raise ValueError(f"{label} must not contain duplicates")
+        if self.day_roll_window < 3 or self.day_roll_window % 2 == 0:
+            raise ValueError("day_roll_window must be an odd integer >= 3")
+        lo, hi = self.day_hours
+        if not (0 <= lo <= hi <= 23):
+            raise ValueError("day_hours must satisfy 0 <= start <= end <= 23")
+        return self
 
 
 class FoldSpec(BaseModel):

@@ -265,3 +265,51 @@ class ArtifactPaths(BaseModel):
     root: Path = repo_root() / "artifacts"
     registry: Path = repo_root() / "artifacts" / "registry.jsonl"
     submissions: Path = repo_root() / "artifacts" / "submissions"
+
+
+class ModelConfig(BaseModel):
+    """GBM 학습 파라미터·시드·가중치·타깃 설정."""
+
+    model_config = ConfigDict(frozen=True)
+
+    objective: Literal["l1"] = "l1"
+    learning_rate: float = 0.05
+    num_leaves: int = 127
+    min_child_samples: int = 200
+    subsample: float = 0.8
+    subsample_freq: int = 1
+    colsample_bytree: float = 0.8
+    reg_lambda: float = 0.0
+    n_rounds: int = 500
+    n_jobs: int = 6
+    seeds: tuple[int, ...] = (0, 1, 2)
+    weight: Literal["smp_k_cap", "k_cap", "none"] = "smp_k_cap"
+    target_clip_max: float = 1.2
+    min_weight: float = 1e-3
+
+    @model_validator(mode="after")
+    def _check_model(self) -> ModelConfig:
+        for name in ("learning_rate", "subsample", "colsample_bytree", "reg_lambda", "target_clip_max", "min_weight"):
+            if not isfinite(getattr(self, name)):
+                raise ValueError(f"{name} must be finite")
+        if self.min_child_samples < 1 or self.subsample_freq < 0 or self.reg_lambda < 0:
+            raise ValueError("min_child_samples must be positive; subsample_freq and reg_lambda must be non-negative")
+        if not 0.0 < self.learning_rate <= 1.0:
+            raise ValueError("learning_rate must be in (0, 1]")
+        if self.num_leaves < 2:
+            raise ValueError("num_leaves must be >= 2")
+        if self.n_rounds < 1:
+            raise ValueError("n_rounds must be >= 1")
+        if self.n_jobs < 1:
+            raise ValueError("n_jobs must be >= 1")
+        if not 0.0 < self.subsample <= 1.0:
+            raise ValueError("subsample must be in (0, 1]")
+        if not 0.0 < self.colsample_bytree <= 1.0:
+            raise ValueError("colsample_bytree must be in (0, 1]")
+        if len(self.seeds) < 1 or len(set(self.seeds)) != len(self.seeds):
+            raise ValueError("seeds must be non-empty and distinct")
+        if self.target_clip_max < 1.0:
+            raise ValueError("target_clip_max must be >= 1")
+        if self.min_weight <= 0.0:
+            raise ValueError("min_weight must be > 0")
+        return self

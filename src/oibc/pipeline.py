@@ -49,6 +49,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     val.add_argument("--save-oof", action="store_true")
     comp_cmd = sub.add_parser("compose")
     comp_cmd.add_argument("--comp-id", required=True)
+    rn = sub.add_parser("report-netting")
+    rn.add_argument("--run-id", required=True)
+    rn.add_argument("--composition", action="append", required=True)
+    rn.add_argument("--n-random", type=int, default=200)
+    rn.add_argument("--seed", type=int, default=0)
     sub_cmd = sub.add_parser("submit")
     sub_cmd.add_argument("--run-id", required=True)
     sub_cmd.add_argument("--sub-id", required=True)
@@ -159,6 +164,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             local_metrics=local_metrics,
             spec=spec,
         )
+    elif args.command == "report-netting":
+        import json
+
+        from src.oibc.config import ArtifactPaths as _ArtifactPaths
+        from src.oibc.train.runner import netting_report
+
+        net_report = netting_report(
+            args.run_id,
+            list(args.composition),
+            n_random=args.n_random,
+            seed=args.seed,
+        )
+        run_dir = _ArtifactPaths().runs / args.run_id
+        out_path = run_dir / f"netting_n{args.n_random}_seed{args.seed}.json"
+        if out_path.exists() or out_path.is_symlink():
+            raise FileExistsError(f"report-netting: already exists {out_path}")
+        run_dir.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(net_report, ensure_ascii=False, indent=2, allow_nan=False)
+        with out_path.open("x", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.write("\n")
+        logger.info("[VPP] netting report run=%s path=%s", args.run_id, out_path)
     elapsed = time.perf_counter() - start
     logger.info("[SYS] pipeline %s done in %.1fs", args.command, elapsed)
     return exit_code

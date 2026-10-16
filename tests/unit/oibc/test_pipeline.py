@@ -485,3 +485,44 @@ def test_pipeline_submit_missing_sha_non_reference_rejected(
     monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: pytest.fail("sha 없이 제출 진행"))
     with pytest.raises(runner_mod.RunnerError, match="composition_sha256"):
         main(["submit", "--run-id", "r1", "--sub-id", "s1"])
+
+
+def test_pipeline_report_netting_writes_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+
+    import src.oibc.pipeline as pipeline_mod
+    from src.oibc.train import runner as runner_mod
+
+    report = {
+        "run_id": "r1",
+        "pred_col": "pred_bag",
+        "n_random": 4,
+        "seed": 0,
+        "compositions": {"current_group": "abc"},
+        "folds": {},
+    }
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        runner_mod, "netting_report", lambda *a, **k: calls.append((a, k)) or report
+    )
+    import src.oibc.config as config_mod
+
+    paths = config_mod.ArtifactPaths(
+        root=tmp_path,
+        registry=tmp_path / "registry.jsonl",
+        submissions=tmp_path / "subs",
+        runs=tmp_path / "runs",
+        compositions=tmp_path / "comps",
+    )
+    monkeypatch.setattr(config_mod, "ArtifactPaths", lambda *a, **k: paths)
+    monkeypatch.setattr(pipeline_mod, "ArtifactPaths", lambda *a, **k: paths, raising=False)
+    run_dir = paths.runs / "r1"
+    run_dir.mkdir(parents=True)
+    assert main(["report-netting", "--run-id", "r1", "--composition", "current_group", "--n-random", "4", "--seed", "0"]) == 0
+    out = run_dir / "netting_n4_seed0.json"
+    assert out.exists()
+    assert json.loads(out.read_text(encoding="utf-8")) == report
+    before = out.read_bytes()
+    with pytest.raises(FileExistsError):
+        main(["report-netting", "--run-id", "r1", "--composition", "current_group", "--n-random", "4", "--seed", "0"])
+    assert out.read_bytes() == before

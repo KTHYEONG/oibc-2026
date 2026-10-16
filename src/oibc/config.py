@@ -282,7 +282,6 @@ REFERENCE_COMP_ID: Final = "current_group"
 class ComposeConfig(BaseModel):
     """지리 층 반클러스터링 구성 파라미터."""
 
-    # 출처: scratch/vpp/README.md
     model_config = ConfigDict(frozen=True)
 
     n_strata: int = 64

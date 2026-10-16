@@ -338,3 +338,19 @@ def test_compose_config_rejects_invalid(kwargs: dict) -> None:
 def test_artifact_paths_compositions_under_root() -> None:
     p = ArtifactPaths()
     assert p.compositions == p.root / "compositions"
+
+
+def test_run_config_composition_default_reference() -> None:
+    assert RunConfig(run_id="r1", hypothesis="h").composition_id == "current_group"
+
+
+@pytest.mark.parametrize("value", ["../x", ""])
+def test_run_config_composition_rejects_unsafe(value: str) -> None:
+    with pytest.raises(ValidationError):
+        RunConfig(run_id="r1", hypothesis="h", composition_id=value)
+
+
+def test_run_config_legacy_record_loads() -> None:
+    data = RunConfig(run_id="r1", hypothesis="h").model_dump(mode="json")
+    data.pop("composition_id")
+    assert RunConfig.model_validate(data).composition_id == "current_group"

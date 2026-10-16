@@ -343,7 +343,7 @@ def test_real_panel_seed_deterministic() -> None:
     panel = pd.read_parquet(panel_path)
     panel = panel.loc[panel["period"] == "train"]
     features = feature_columns(panel, FeatureConfig())
-    assignment = runner_mod._resolve_assignment(panel)
+    assignment, _ = runner_mod._resolve_assignment(panel)
     smp = runner_mod._resolve_smp(panel)
     default = ValidationConfig()
     vcfg = ValidationConfig(folds=(default.folds[1],), seeds=(0,), bootstrap_n=100)
@@ -1131,3 +1131,227 @@ def test_comparable_metadata_boundaries(tmp_path: Path, monkeypatch: pytest.Monk
     config["features"]["groups"].reverse()
     changed = record.model_copy(update={"config": config})
     assert runner_mod._config_diff_keys(changed, cfg) == []
+
+
+def _sites4(cap: float = 100.0) -> pd.DataFrame:
+    return pd.DataFrame(
+        {"site_id": SITES, "current_group": [GROUPS[s] for s in SITES], "capacity_kw": [cap] * 4}
+    )
+
+
+def _swapped_assignment() -> pd.DataFrame:
+    return pd.DataFrame(
+        {"site_id": SITES, "group": ["G2", "G1", "G1", "G2"]},
+    )
+
+
+def _comp_paths(tmp_path: Path) -> ArtifactPaths:
+    return ArtifactPaths(
+        root=tmp_path,
+        registry=tmp_path / "registry.jsonl",
+        submissions=tmp_path / "subs",
+        runs=tmp_path / "runs",
+        compositions=tmp_path / "comps",
+    )
+
+
+def test_resolve_composition_reference_matches_current_group() -> None:
+    from src.oibc.compose.store import assignment_sha256
+
+    assignment, sha = runner_mod.resolve_composition("current_group", _sites4(), spec=_spec())
+    assert assignment.set_index("site_id")["group"].to_dict() == {
+        "PV001": "G1", "PV002": "G1", "PV003": "G2", "PV004": "G2",
+    }
+    assert sha == assignment_sha256(runner_mod.reference_assignment(_sites4()))
+
+
+def test_resolve_composition_loads_saved(tmp_path: Path) -> None:
+    from src.oibc.compose.store import assignment_sha256, load_composition, write_composition
+    from src.oibc.config import ComposeConfig
+
+    paths = _comp_paths(tmp_path)
+    want = _swapped_assignment()
+    write_composition(want, "t1", ComposeConfig(), _sites4(), paths=paths, spec=_spec())
+    got, sha = runner_mod.resolve_composition("t1", _sites4(), paths=paths, spec=_spec())
+    pd.testing.assert_frame_equal(got, load_composition("t1", _sites4(), paths=paths, spec=_spec())[0])
+    assert sha == assignment_sha256(want)
+
+
+def test_resolve_composition_unknown_id_fails_closed(tmp_path: Path) -> None:
+    with pytest.raises(RunnerError):
+        runner_mod.resolve_composition("nope", _sites4(), paths=_comp_paths(tmp_path), spec=_spec())
+
+
+def test_resolve_composition_reference_below_capacity_fails() -> None:
+    with pytest.raises(RunnerError):
+        runner_mod.resolve_composition("current_group", _sites4(cap=10.0), spec=_spec())
+
+
+def test_run_validation_records_composition(tmp_path: Path) -> None:
+    from src.oibc.compose.store import load_composition, write_composition
+    from src.oibc.config import ComposeConfig
+    from src.oibc.evaluate.registry import read_records
+
+    panel = _make_panel(tmp_path)
+    paths = _comp_paths(tmp_path)
+    write_composition(_swapped_assignment(), "t1", ComposeConfig(), _sites4(), paths=paths, spec=_spec())
+    cfg = _cfg("comp-rec", composition_id="t1")
+    rec = run_validation(cfg, panel_path=panel, vcfg=_vcfg(), paths=paths, spec=_spec())
+    assert rec.config["composition_id"] == "t1"
+    assert rec.config["composition_sha256"] == load_composition("t1", _sites4(), paths=paths, spec=_spec())[1]
+    assert read_records(paths.registry) == [rec]
+
+
+def test_run_validation_composition_changes_settlement_only(tmp_path: Path) -> None:
+    from src.oibc.compose.store import write_composition
+    from src.oibc.config import ComposeConfig
+    from src.oibc.cv.splits import fold_masks
+    from src.oibc.features.panel import feature_columns
+    from src.oibc.models.gbm import fit_seed_models, predict_seed_kwh
+
+    panel = _make_panel(tmp_path)
+    paths = _comp_paths(tmp_path)
+    vcfg = _vcfg()
+    write_composition(_swapped_assignment(), "t1", ComposeConfig(), _sites4(), paths=paths, spec=_spec())
+    run_validation(_cfg("ref-leg"), panel_path=panel, vcfg=vcfg, paths=paths, spec=_spec())
+    run_validation(_cfg("swap-leg", composition_id="t1"), panel_path=panel, vcfg=vcfg, paths=paths, spec=_spec())
+    ref = load_daily_runs("ref-leg", "all", paths=paths, vcfg=vcfg)
+    swap = load_daily_runs("swap-leg", "all", paths=paths, vcfg=vcfg)
+    ref_rev = sum(float(f["revenue"].sum()) for frames in ref.values() for f in frames)
+    swap_rev = sum(float(f["revenue"].sum()) for frames in swap.values() for f in frames)
+    assert ref_rev == pytest.approx(swap_rev)
+    train = pd.read_parquet(panel).query("period == 'train'")
+    cfg = _cfg("expected")
+    features = feature_columns(train, cfg.features)
+    for fold in vcfg.folds:
+        tr, te = fold_masks(train["op_date"], fold, vcfg)
+        day = train.loc[te].reset_index(drop=True)
+        preds = predict_seed_kwh(fit_seed_models(train.loc[tr], features, cfg.model), day, features)
+        for assignment, daily_runs in ((reference_assignment(_sites4()), ref), (_swapped_assignment(), swap)):
+            group_map = assignment.set_index("site_id")["group"]
+            for idx, pred in enumerate(preds):
+                residual = day[["ts", "op_date"]].assign(
+                    group=day["site_id"].map(group_map), error=pred - day["energy"].to_numpy(),
+                )
+                net = residual.groupby(["op_date", "ts", "group"])["error"].sum().abs()
+                expected = (net * 100.0 * 3 * 0.10).groupby(level="op_date").sum()
+                expected += 4 * 2.0 * 100.0 * 0.10
+                np.testing.assert_allclose(daily_runs[fold.name][idx]["penalty"], expected)
+
+
+def test_config_diff_flags_composition(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _comp_paths(tmp_path)
+    _clean_git(monkeypatch)
+    run_validation(_cfg("base"), panel_path=panel, vcfg=_vcfg(), paths=paths, spec=_spec())
+    from src.oibc.evaluate.registry import read_records
+
+    record = next(r for r in read_records(paths.registry) if r.run_id == "base")
+    legacy = record.model_copy(update={"config": {k: v for k, v in record.config.items() if k != "composition_id"}})
+    cand = _cfg("cand", composition_id="geo64-s0")
+    assert "composition_id" in runner_mod._config_diff_keys(legacy, cand)
+
+
+def test_forecast_eval_uses_run_composition(tmp_path: Path) -> None:
+    from src.oibc.compose.store import write_composition
+    from src.oibc.config import ComposeConfig
+    from src.oibc.features.panel import feature_columns
+    from src.oibc.models.gbm import bag, fit_seed_models, predict_seed_kwh
+
+    panel = _make_panel(tmp_path)
+    paths = _comp_paths(tmp_path)
+    write_composition(_swapped_assignment(), "t1", ComposeConfig(), _sites4(), paths=paths, spec=_spec())
+    ref = forecast_eval(_cfg("r1"), panel_path=panel, spec=_spec())
+    swap = forecast_eval(_cfg("r2", composition_id="t1"), panel_path=panel, spec=_spec(), paths=paths)
+    assert float(ref["forecast_kwh"].sum()) == pytest.approx(float(swap["forecast_kwh"].sum()))
+    ref_g1 = ref.loc[ref["group"] == "G1"].sort_values("ts")["forecast_kwh"].to_numpy()
+    swap_g1 = swap.loc[swap["group"] == "G1"].sort_values("ts")["forecast_kwh"].to_numpy()
+    assert not bool((ref_g1 == swap_g1).all())
+    frame = pd.read_parquet(panel)
+    cfg = _cfg("expected")
+    features = feature_columns(frame, cfg.features)
+    day = frame.loc[frame["period"] == "eval"].copy()
+    models = fit_seed_models(frame.loc[frame["period"] == "train"], features, cfg.model)
+    day["pred"] = bag(predict_seed_kwh(models, day, features))
+    day["group"] = day["site_id"].map(_swapped_assignment().set_index("site_id")["group"])
+    expected = day.groupby(["group", "ts"])["pred"].sum()
+    actual = swap.set_index(["group", "ts"])["forecast_kwh"]
+    np.testing.assert_allclose(actual.reindex(expected.index), expected, rtol=1e-12)
+
+
+def test_validation_accepts_panel_site_subset(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    path = _make_panel(tmp_path)
+    panel = pd.read_parquet(path)
+    panel.loc[panel["site_id"] != "PV004"].to_parquet(path, index=False)
+    gen_path = tmp_path / "canonical" / "generation.parquet"
+    generation = pd.read_parquet(gen_path)
+    generation.loc[~(generation["site_id"].eq("PV004") & generation["ts"].dt.hour.ne(1))].to_parquet(
+        gen_path, index=False,
+    )
+    with caplog.at_level(logging.INFO):
+        rec = run_validation(_cfg("subset"), panel_path=path, vcfg=_vcfg(), paths=_comp_paths(tmp_path))
+    assert rec.config["composition_id"] == "current_group"
+    message = next(r.message for r in caplog.records if "run=subset composition_id=" in r.message)
+    assert "caps={'G1': 200.0, 'G2': 200.0}" in message
+
+
+def test_resolve_assignment_explicit_spec(tmp_path: Path) -> None:
+    panel = _make_panel(tmp_path)
+    assignment, sha = runner_mod._resolve_assignment(pd.read_parquet(panel), spec=_spec())
+    assert set(assignment["group"].tolist()) == {"G1", "G2"}
+    assert len(sha) == 64
+
+
+def test_resolve_assignment_none_composition_rejected(tmp_path: Path) -> None:
+    panel = _make_panel(tmp_path)
+    with pytest.raises(RunnerError, match="unsafe comp_id"):
+        runner_mod._resolve_assignment(pd.read_parquet(panel), None)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_pipeline_submission_composition_roundtrip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy: bool,
+) -> None:
+    import json
+
+    from src.oibc import pipeline
+    from src.oibc.compose import store
+    from src.oibc.config import ComposeConfig
+    from src.oibc.evaluate import registry
+    from src.oibc.submit import build, validate
+
+    panel = _make_panel(tmp_path)
+    paths = _comp_paths(tmp_path)
+    comp_id = "current_group" if legacy else "t1"
+    assignment = reference_assignment(_sites4()) if legacy else _swapped_assignment()
+    if not legacy:
+        store.write_composition(assignment, comp_id, ComposeConfig(), _sites4(), paths=paths, spec=_spec())
+    cfg = _cfg("roundtrip", composition_id=comp_id)
+    rec = run_validation(cfg, panel_path=panel, vcfg=_vcfg(), paths=paths, spec=_spec())
+    digest = rec.config["composition_sha256"]
+    if legacy:
+        config = {k: v for k, v in rec.config.items() if k not in {"composition_id", "composition_sha256"}}
+        rec = rec.model_copy(update={"config": config})
+        paths.registry.write_text(rec.model_dump_json() + "\n", encoding="utf-8")
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _sites4().to_csv(raw / "sites.csv", index=False)
+    stamps = pd.date_range(_spec().eval_start, _spec().eval_end, freq="h")
+    pd.DataFrame({"ts": stamps, "smp": 100.0}).to_csv(raw / "smp.csv", index=False)
+    data = runner_mod.DataPaths().model_copy(update={"raw_dir": raw})
+    monkeypatch.setattr(pipeline, "DataPaths", lambda: data)
+    monkeypatch.setattr(validate, "DataPaths", lambda: data)
+    for module in (registry, store, build):
+        monkeypatch.setattr(module, "ArtifactPaths", lambda: paths)
+    assert pipeline.main(["submit", "--run-id", cfg.run_id, "--sub-id", "s1"]) == 0
+    folder = paths.submissions / "s1"
+    manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["composition_id"] == comp_id
+    assert manifest["composition_sha256"] == digest
+    got = pd.read_csv(folder / "composition.csv", dtype="string")
+    pd.testing.assert_frame_equal(got, assignment.astype("string"))
+    report = validate.validate_submission(folder / "composition.csv", folder / "forecast.csv", spec=_spec())
+    assert report.ok
+    assert sum(report.group_forecast_total_kwh.values()) > 0

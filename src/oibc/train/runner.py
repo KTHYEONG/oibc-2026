@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from src.oibc.config import (
+    REFERENCE_COMP_ID,
     ArtifactPaths,
     CompetitionSpec,
     DataPaths,
@@ -183,10 +184,33 @@ def _normalize_diff_value(value: object) -> object:
     return value
 
 
+def resolve_composition(
+    composition_id: str, sites: pd.DataFrame,
+    *, paths: ArtifactPaths | None = None, spec: CompetitionSpec | None = None,
+) -> tuple[pd.DataFrame, str]:
+    """composition_id에 해당하는 검증된 (site_id, group) 배정과 assignment_sha256을 반환한다."""
+    from src.oibc.compose.constraints import CompositionError, validate_assignment
+    from src.oibc.compose.store import assignment_sha256, load_composition
+
+    comp = spec if spec is not None else CompetitionSpec()
+    try:
+        if composition_id == REFERENCE_COMP_ID:
+            assignment = reference_assignment(sites)
+            validate_assignment(assignment, sites, spec=comp)
+        else:
+            assignment, _ = load_composition(composition_id, sites, paths=paths, spec=comp)
+        return assignment, assignment_sha256(assignment)
+    except CompositionError as exc:
+        raise RunnerError(str(exc)) from exc
+
+
 def _config_diff_keys(baseline: ExperimentRecord, cfg: RunConfig) -> list[str]:
     current = cfg.model_dump(mode="json")
     base_config = baseline.config if isinstance(baseline.config, dict) else {}
     out: list[str] = []
+    base_comp = base_config.get("composition_id", REFERENCE_COMP_ID)
+    if current.get("composition_id", REFERENCE_COMP_ID) != base_comp:
+        out.append("composition_id")
     for section in ("features", "model"):
         cur_section = current.get(section)
         base_section = base_config.get(section)
@@ -262,20 +286,16 @@ def _check_keys(frame: pd.DataFrame) -> None:
         raise RunnerError("inconsistent op_date")
 
 
-def _resolve_assignment(panel: pd.DataFrame, spec: CompetitionSpec | None = None) -> pd.DataFrame:
+def _resolve_assignment(
+    panel: pd.DataFrame,
+    composition_id: str = REFERENCE_COMP_ID,
+    spec: CompetitionSpec | None = None,
+    paths: ArtifactPaths | None = None,
+) -> tuple[pd.DataFrame, str]:
     comp = spec if spec is not None else CompetitionSpec()
     sites = _read(DataPaths().canonical_dir / "sites.parquet", ["site_id", "current_group", "capacity_kw"])
-    assignment = reference_assignment(sites)
-    capacity = sites["capacity_kw"].to_numpy(dtype="float64")
-    totals = sites.assign(group=sites["current_group"].map({"A": "G1", "B": "G2"})).groupby("group")["capacity_kw"].sum()
-    if (
-        len(sites) != comp.n_sites
-        or not np.isfinite(capacity).all()
-        or (capacity <= 0).any()
-        or set(totals.index) != set(comp.groups)
-        or (totals < comp.min_group_capacity_kw).any()
-        or not panel["site_id"].isin(sites["site_id"]).all()
-    ):
+    assignment, sha256 = resolve_composition(composition_id, sites, paths=paths, spec=comp)
+    if not panel["site_id"].isin(sites["site_id"]).all():
         raise RunnerError("sites: invalid partition, capacity or unknown panel site")
     metadata = sites.set_index("site_id")
     _require(
@@ -283,7 +303,7 @@ def _resolve_assignment(panel: pd.DataFrame, spec: CompetitionSpec | None = None
         and np.array_equal(panel["capacity_kw"].to_numpy(), panel["site_id"].map(metadata["capacity_kw"]).to_numpy()),
         "panel: site metadata changed since feature construction",
     )
-    return assignment
+    return assignment, sha256
 
 
 def _resolve_smp(panel: pd.DataFrame, spec: CompetitionSpec | None = None) -> pd.DataFrame:
@@ -440,7 +460,17 @@ def run_validation(
         config_diff = _check_comparable(matches[0], cfg, panel_hash, val, comp)
     panel = _load_panel(panel_file, cfg, comp)
     train_panel = panel[panel["period"] == "train"].reset_index(drop=True)
-    assignment = _resolve_assignment(panel, comp)
+    assignment, comp_sha = _resolve_assignment(panel, cfg.composition_id, comp, base)
+    sites = _read(DataPaths().canonical_dir / "sites.parquet", ["site_id", "capacity_kw"])
+    site_cap = sites.set_index("site_id")["capacity_kw"]
+    caps = {
+        g: float(site_cap[assignment.loc[assignment["group"] == g, "site_id"]].sum())
+        for g in comp.groups
+    }
+    logger.info(
+        "[VPP] run=%s composition_id=%s sha256=%s caps=%s",
+        cfg.run_id, cfg.composition_id, comp_sha, caps,
+    )
     smp_full = _resolve_smp(panel, comp)
     night_all = _night_frame(train_panel["ts"], cfg.features.day_min_elev_deg, spec=comp, day_rows=train_panel)
     if not night_all["site_id"].isin(assignment["site_id"]).all():
@@ -548,6 +578,7 @@ def run_validation(
             "warm": comparison_to_dict(compare_runs(cand_warm, base_warm, val)),
         }
     config = dict(cfg.model_dump(mode="json"))
+    config["composition_sha256"] = comp_sha
     if _sha256(panel_file) != panel_hash:
         raise RunnerError("panel: changed during validation")
     config["panel_path"] = str(panel_file.resolve())
@@ -581,6 +612,7 @@ def forecast_eval(
     *,
     panel_path: Path | None = None,
     spec: CompetitionSpec | None = None,
+    paths: ArtifactPaths | None = None,
 ) -> pd.DataFrame:
     """학습 기간 전체로 학습한 seed-bag 모델의 평가 기간 (group, ts, forecast_kwh) 예측을 반환한다."""
     comp = spec if spec is not None else CompetitionSpec()
@@ -589,7 +621,7 @@ def forecast_eval(
     train = panel[panel["period"] == "train"].reset_index(drop=True)
     eval_day = panel[panel["period"] == "eval"].reset_index(drop=True)
     features = feature_columns(panel, cfg.features)
-    assignment = _resolve_assignment(panel, comp)
+    assignment, _ = _resolve_assignment(panel, cfg.composition_id, comp, paths)
     smp = _resolve_smp(panel, comp)
     eval_ts = pd.DatetimeIndex(smp.loc[smp["period"] == "eval", "ts"]).sort_values()
     if not eval_ts.equals(pd.date_range(comp.eval_start, comp.eval_end, freq="h").as_unit("us")):

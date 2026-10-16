@@ -11,7 +11,9 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from src.oibc.config import (
+    REFERENCE_COMP_ID,
     CompetitionSpec,
+    ComposeConfig,
     DataPaths,
     FeatureConfig,
     ModelConfig,
@@ -40,9 +42,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     val.add_argument("--run-id", required=True)
     val.add_argument("--hypothesis", required=True)
     val.add_argument("--baseline", default=None)
+    val.add_argument("--composition", default=REFERENCE_COMP_ID)
     val.add_argument("--drop-group", action="append", choices=sorted(FeatureConfig().groups), default=[])
     val.add_argument("--weight", choices=["smp_k_cap", "k_cap", "none"], default="smp_k_cap")
     val.add_argument("--allow-commit-drift", action="store_true")
+    comp_cmd = sub.add_parser("compose")
+    comp_cmd.add_argument("--comp-id", required=True)
     sub_cmd = sub.add_parser("submit")
     sub_cmd.add_argument("--run-id", required=True)
     sub_cmd.add_argument("--sub-id", required=True)
@@ -70,17 +75,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                 run_id=args.run_id,
                 hypothesis=args.hypothesis,
                 baseline_run_id=args.baseline,
+                composition_id=args.composition,
                 features=FeatureConfig(groups=frozenset(groups)),
                 model=ModelConfig(weight=args.weight),
                 allow_commit_drift=args.allow_commit_drift,
             )
         )
+    elif args.command == "compose":
+        import pandas as pd
+
+        from src.oibc.compose.anticluster import build_composition
+        from src.oibc.compose.constraints import validate_assignment
+        from src.oibc.compose.store import write_composition
+
+        compose_cfg = ComposeConfig()
+        sites = pd.read_parquet(DataPaths().canonical_dir / "sites.parquet")
+        assignment = build_composition(sites, compose_cfg)
+        out_path = write_composition(assignment, args.comp_id, compose_cfg, sites)
+        caps = validate_assignment(assignment, sites)
+        logger.info("[VPP] compose id=%s path=%s caps=%s", args.comp_id, out_path, caps)
     elif args.command == "submit":
         import pandas as pd
 
         from src.oibc.evaluate.registry import read_records
         from src.oibc.submit.build import write_submission
-        from src.oibc.train.runner import RunnerError, forecast_eval, reference_assignment
+        from src.oibc.train.runner import RunnerError, forecast_eval, resolve_composition
 
         records = read_records()
         match = next((r for r in records if r.run_id == args.run_id), None)
@@ -116,14 +135,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             or not all(math.isfinite(v) and v >= 0 for v in local_metrics.values())
         ):
             raise RunnerError("submit: changed panel, seeds or invalid metrics")
-        forecast = forecast_eval(cfg, panel_path=panel_path, spec=spec)
         sites = pd.read_parquet(DataPaths().canonical_dir / "sites.parquet")
+        assignment, comp_sha = resolve_composition(cfg.composition_id, sites, spec=spec)
+        if "composition_sha256" in config:
+            if config["composition_sha256"] != comp_sha:
+                raise RunnerError("submit: composition hash drift")
+        elif cfg.composition_id != REFERENCE_COMP_ID:
+            raise RunnerError("submit: missing composition_sha256")
+        forecast = forecast_eval(cfg, panel_path=panel_path, spec=spec)
+        _, final_sha = resolve_composition(
+            cfg.composition_id, pd.read_parquet(DataPaths().canonical_dir / "sites.parquet"), spec=spec,
+        )
+        if final_sha != comp_sha:
+            raise RunnerError("submit: composition changed during inference")
         write_submission(
-            reference_assignment(sites),
+            assignment,
             forecast,
             args.sub_id,
             run_id=args.run_id,
-            composition_id="current_group",
+            composition_id=cfg.composition_id,
             local_metrics=local_metrics,
             spec=spec,
         )

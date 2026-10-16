@@ -33,7 +33,7 @@ from src.oibc.timeaxis import k_weight, op_date, require_hourly_kst
 
 logger = logging.getLogger(__name__)
 
-_BAG_NOTE = "운영 예측은 seed-bag(분산 축소, 채택 규칙 예외; probe-fe-20261016 근거)"
+_BAG_NOTE = "운영 예측은 seed-bag: |F−A| 볼록성으로 평균 예측의 W ≤ 단일 W 평균(Jensen), 실측 −0.4% (probe 2026-10-16)"  # noqa: RUF001
 
 
 class RunnerError(ValueError):
@@ -158,6 +158,77 @@ def _git_commit() -> str | None:
     if res.returncode != 0:
         return None
     return res.stdout.strip() or None
+
+
+def _git_tree_dirty() -> bool | None:
+    try:
+        res = subprocess.run(  # noqa: S603
+            ["git", "status", "--porcelain", "--untracked-files=no"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    return bool(res.stdout.strip())
+
+
+def _normalize_diff_value(value: object) -> object:
+    if isinstance(value, (set, frozenset)):
+        return sorted(value)
+    if isinstance(value, tuple):
+        return list(value)
+    return value
+
+
+def _config_diff_keys(baseline: ExperimentRecord, cfg: RunConfig) -> list[str]:
+    current = cfg.model_dump(mode="json")
+    base_config = baseline.config if isinstance(baseline.config, dict) else {}
+    out: list[str] = []
+    for section in ("features", "model"):
+        cur_section = current.get(section)
+        base_section = base_config.get(section)
+        if not isinstance(cur_section, dict) or not isinstance(base_section, dict):
+            raise RunnerError(f"baseline: missing or invalid {section} config")
+        out.extend(
+            f"{section}.{key}"
+            for key in sorted(set(cur_section) | set(base_section))
+            if (
+                sorted(cur_section[key]) != sorted(base_section[key])
+                if section == "features" and key == "groups" and key in base_section
+                else _normalize_diff_value(cur_section.get(key)) != _normalize_diff_value(base_section.get(key))
+            )
+        )
+    return sorted(out)
+
+
+def _check_comparable(
+    baseline: ExperimentRecord,
+    cfg: RunConfig,
+    panel_hash: str | None,
+    val: ValidationConfig,
+    comp: CompetitionSpec,
+) -> list[str]:
+    if tuple(baseline.seeds) != tuple(val.seeds):
+        raise RunnerError("baseline: seeds mismatch")
+    if tuple(baseline.folds) != tuple(f.name for f in val.folds):
+        raise RunnerError("baseline: folds mismatch")
+    base_config = baseline.config if isinstance(baseline.config, dict) else {}
+    if base_config.get("validation") != val.model_dump(mode="json"):
+        raise RunnerError("baseline: validation config mismatch")
+    if base_config.get("competition") != comp.model_dump(mode="json"):
+        raise RunnerError("baseline: competition spec mismatch")
+    if panel_hash is None or base_config.get("panel_sha256") != panel_hash:
+        raise RunnerError("baseline: panel hash mismatch")
+    current_commit = _git_commit()
+    if (current_commit is None or current_commit != baseline.git_commit) and not cfg.allow_commit_drift:
+        raise RunnerError("baseline: git commit drift")
+    dirty = _git_tree_dirty()
+    if (dirty is not False or base_config.get("git_dirty") is not False) and not cfg.allow_commit_drift:
+        raise RunnerError("baseline: dirty work tree")
+    return _config_diff_keys(baseline, cfg)
 
 
 def _default_panel_path() -> Path:
@@ -361,6 +432,12 @@ def run_validation(
             load_daily_runs(cfg.baseline_run_id, subset, paths=base, vcfg=val)
     panel_file = panel_path if panel_path is not None else _default_panel_path()
     panel_hash = _sha256(panel_file) if panel_file.exists() else None
+    config_diff: list[str] = []
+    if cfg.baseline_run_id is not None:
+        matches = [r for r in read_records(base.registry) if r.run_id == cfg.baseline_run_id]
+        if not matches:
+            raise RunnerError(f"registry: unknown baseline {cfg.baseline_run_id!r}")
+        config_diff = _check_comparable(matches[0], cfg, panel_hash, val, comp)
     panel = _load_panel(panel_file, cfg, comp)
     train_panel = panel[panel["period"] == "train"].reset_index(drop=True)
     assignment = _resolve_assignment(panel, comp)
@@ -460,7 +537,7 @@ def run_validation(
         )
         del models, preds, bag_pred, train_fold, test_day
         gc.collect()
-    comparison: dict[str, object] = {"bag": bag_w}
+    comparison: dict[str, object] = {"bag": bag_w, "config_diff": config_diff}
     if cfg.baseline_run_id is not None:
         cand_all = load_daily_runs(cfg.run_id, "all", paths=base, vcfg=val)
         base_all = load_daily_runs(cfg.baseline_run_id, "all", paths=base, vcfg=val)
@@ -477,7 +554,11 @@ def run_validation(
     config["panel_sha256"] = panel_hash
     config["validation"] = val.model_dump(mode="json")
     config["competition"] = comp.model_dump(mode="json")
+    dirty_state = _git_tree_dirty()
+    config["git_dirty"] = bool(dirty_state) if dirty_state is not None else True
     note = f"{cfg.note} | {_BAG_NOTE}" if cfg.note else _BAG_NOTE
+    if cfg.allow_commit_drift:
+        note = f"{note} | commit_drift_allowed"
     record = ExperimentRecord(
         run_id=cfg.run_id,
         created_at=datetime.now().astimezone(),

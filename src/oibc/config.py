@@ -222,6 +222,8 @@ class ValidationConfig(BaseModel):
     ci_level: float = 0.95
     min_rel_improvement: float = 0.01
     min_quarter_win_ratio: float = 0.7
+    noise_z: float = 2.0
+    min_noise_df: int = 4
 
     @model_validator(mode="after")
     def _check_validation(self) -> ValidationConfig:
@@ -249,12 +251,16 @@ class ValidationConfig(BaseModel):
             raise ValueError("bootstrap_block_days must be >= 1")
         if self.bootstrap_n < 100:
             raise ValueError("bootstrap_n must be >= 100")
-        if not 0.0 < self.ci_level < 1.0:
+        if not 0.0 < self.ci_level < 1.0 or not 0.5 < (1.0 + self.ci_level) / 2.0 < 1.0:
             raise ValueError("ci_level must be in (0, 1)")
         if not 0.0 <= self.min_rel_improvement < 1.0:
             raise ValueError("min_rel_improvement must be in [0, 1)")
         if not 0.0 < self.min_quarter_win_ratio <= 1.0:
             raise ValueError("min_quarter_win_ratio must be in (0, 1]")
+        if not isfinite(self.noise_z) or not self.noise_z > 0:
+            raise ValueError("noise_z must be finite and > 0")
+        if self.min_noise_df < 1:
+            raise ValueError("min_noise_df must be >= 1")
         return self
 
 
@@ -331,6 +337,7 @@ class RunConfig(BaseModel):
     model: ModelConfig = ModelConfig()
     baseline_run_id: str | None = None
     note: str = ""
+    allow_commit_drift: bool = False
 
     @field_validator("run_id", "baseline_run_id")
     @classmethod

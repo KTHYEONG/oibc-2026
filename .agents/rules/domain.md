@@ -18,7 +18,7 @@
 
 ## 3. Validation & Leakage Control
 - **Chronological Splits:** Folds simulate the real cutoff and are time-ordered over multiple expanding-window folds (`ValidationConfig.folds`). The last 12 training months were already used for model comparison and are no longer an untouched holdout; the evaluation-period leaderboard is the only untouched test. Never tune on leaderboard feedback.
-- **Seed Replication:** compare configurations by the mean over `ValidationConfig.seeds`; differences smaller than the observed seed range are inconclusive.
+- **Seed Replication:** compare configurations by the mean over `ValidationConfig.seeds`; training noise is the pooled seed-to-seed relative SD across folds and both sides, and a gain must exceed `noise_z`× its standard error with the combined (bootstrap + training) CI excluding zero. Never use the seed range as the noise threshold, and never compare runs from different code versions (commit, dirty tree, panel hash).
 - **Paired Uncertainty:** report per-fold relative ΔW with a day-block bootstrap CI and per-quarter signs; report warm-site and cold-start subsets separately.
 - **Leakage Surfaces:** Lag/rolling features, target encodings, scaler/imputer fits, plant-level statistics, and residuals used for VPP assignment must be fit on training data only.
 - **Observation vs. Forecast Weather:** Weather observations exist only for training (raw, with sentinel outliers such as `wa_wind_speed`=9999, `wb_cloud`>100). Models consumed at inference must be trained on forecast-weather inputs (or demonstrably robust to the shift); never train on observed weather and infer on forecasts without validating that gap.

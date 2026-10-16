@@ -3,7 +3,7 @@ import pytest
 from pathlib import Path
 from pydantic import ValidationError
 
-from src.oibc.config import CompetitionSpec, DataPaths, FeatureConfig, FoldSpec, ModelConfig, RunConfig, ValidationConfig, repo_root
+from src.oibc.config import ArtifactPaths, CompetitionSpec, ComposeConfig, DataPaths, FeatureConfig, FoldSpec, ModelConfig, RunConfig, ValidationConfig, repo_root
 
 
 def test_default_spec_self_consistent() -> None:
@@ -309,3 +309,32 @@ def test_validation_noise_params_rejected(kwargs: dict) -> None:
 def test_runconfig_commit_drift_default_denied() -> None:
     cfg = RunConfig(run_id="r1", hypothesis="h")
     assert cfg.allow_commit_drift is False
+
+
+def test_compose_config_defaults_preregistered() -> None:
+    cfg = ComposeConfig()
+    assert cfg.n_strata == 64
+    assert cfg.seed == 0
+    assert cfg.n_init == 10
+    assert cfg.km_per_deg == 111.0
+    assert cfg.ref_lat_deg == 36.5
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"n_strata": 1},
+    {"n_init": 0},
+    {"km_per_deg": 0.0},
+    {"km_per_deg": float("nan")},
+    {"km_per_deg": float("inf")},
+    {"ref_lat_deg": float("nan")},
+    {"ref_lat_deg": 90.0},
+    {"ref_lat_deg": -90.0},
+])
+def test_compose_config_rejects_invalid(kwargs: dict) -> None:
+    with pytest.raises(ValidationError):
+        ComposeConfig(**kwargs)
+
+
+def test_artifact_paths_compositions_under_root() -> None:
+    p = ArtifactPaths()
+    assert p.compositions == p.root / "compositions"

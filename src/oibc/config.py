@@ -6,7 +6,7 @@ import re
 from itertools import pairwise
 from math import isfinite
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -273,6 +273,35 @@ class ArtifactPaths(BaseModel):
     registry: Path = repo_root() / "artifacts" / "registry.jsonl"
     submissions: Path = repo_root() / "artifacts" / "submissions"
     runs: Path = repo_root() / "artifacts" / "runs"
+    compositions: Path = repo_root() / "artifacts" / "compositions"
+
+
+REFERENCE_COMP_ID: Final = "current_group"
+
+
+class ComposeConfig(BaseModel):
+    """지리 층 반클러스터링 구성 파라미터."""
+
+    # 출처: scratch/vpp/README.md
+    model_config = ConfigDict(frozen=True)
+
+    n_strata: int = 64
+    seed: int = 0
+    n_init: int = 10
+    km_per_deg: float = 111.0
+    ref_lat_deg: float = 36.5
+
+    @model_validator(mode="after")
+    def _check_compose(self) -> ComposeConfig:
+        if self.n_strata < 2:
+            raise ValueError("n_strata must be >= 2")
+        if self.n_init < 1:
+            raise ValueError("n_init must be >= 1")
+        if not isfinite(self.km_per_deg) or not self.km_per_deg > 0:
+            raise ValueError("km_per_deg must be finite and > 0")
+        if not isfinite(self.ref_lat_deg) or not -90.0 < self.ref_lat_deg < 90.0:
+            raise ValueError("ref_lat_deg must be finite and in (-90, 90)")
+        return self
 
 
 class ModelConfig(BaseModel):

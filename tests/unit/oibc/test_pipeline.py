@@ -70,6 +70,7 @@ def test_submit_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
     cfg = RunConfig(run_id="r1", hypothesis="h", features=FeatureConfig(groups=frozenset()), model=ModelConfig(seeds=(0,), weight="none"))
     config = cfg.model_dump(mode="json") | {
         "panel_path": str(panel_path), "panel_sha256": hashlib.sha256(panel_path.read_bytes()).hexdigest(),
+        "composition_sha256": "abc",
         "competition": CompetitionSpec().model_dump(mode="json"),
     }
 
@@ -86,6 +87,10 @@ def test_submit_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
     )
     monkeypatch.setattr(registry_mod, "read_records", lambda *a, **k: [rec])
     monkeypatch.setattr(pd, "read_parquet", lambda *a, **k: pd.DataFrame({"site_id": ["s"], "current_group": ["A"]}))
+    monkeypatch.setattr(
+        runner_mod, "resolve_composition",
+        lambda *a, **k: (pd.DataFrame({"site_id": ["s"], "group": ["G1"]}), "abc"),
+    )
     def predict(actual_cfg, **kwargs):
         assert actual_cfg == cfg
         assert kwargs["panel_path"] == panel_path
@@ -251,3 +256,221 @@ def test_validate_submission_warnings_keep_exit_zero(
     with caplog.at_level(logging.INFO):
         assert main(["validate-submission", "--composition", str(comp), "--forecast", str(fc)]) == 0
     assert "over capacity" in caplog.text
+
+
+def test_pipeline_compose_writes_composition(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.pipeline as pipeline_mod
+    from src.oibc.compose import store as store_mod
+    from src.oibc.config import ArtifactPaths, DataPaths
+
+    canon = tmp_path / "canonical"
+    canon.mkdir(exist_ok=True)
+    comps = tmp_path / "comps"
+    import numpy as np
+
+    n = 253
+    ids = [f"PV{i:03d}" for i in range(1, n + 1)]
+    sites = pd.DataFrame(
+        {"site_id": ids, "capacity_kw": [200.0] * n,
+         "lat": 33.0 + (np.arange(n) % 23) * 0.1, "lon": 124.0 + (np.arange(n) // 23) * 0.1,
+         "current_group": ["A" if i % 2 == 0 else "B" for i in range(n)]}
+    )
+    sites.to_parquet(canon / "sites.parquet", index=False)
+    monkeypatch.setattr(pipeline_mod, "DataPaths", lambda *a, **k: DataPaths(canonical_dir=canon))
+    paths = ArtifactPaths(root=tmp_path, registry=tmp_path / "registry.jsonl",
+                          submissions=tmp_path / "subs", runs=tmp_path / "runs", compositions=comps)
+    monkeypatch.setattr(store_mod, "ArtifactPaths", lambda *a, **k: paths)
+    assert main(["compose", "--comp-id", "t1"]) == 0
+    assert (comps / "t1.csv").exists() and (comps / "t1.json").exists()
+    from src.oibc.compose.store import load_composition
+
+    load_composition("t1", pd.read_parquet(canon / "sites.parquet"))
+
+
+def test_pipeline_compose_refuses_existing_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.pipeline as pipeline_mod
+    from src.oibc.compose import store as store_mod
+    from src.oibc.compose.constraints import CompositionError
+    from src.oibc.config import ArtifactPaths, DataPaths
+
+    canon = tmp_path / "canonical"
+    canon.mkdir(exist_ok=True)
+    comps = tmp_path / "comps"
+    import numpy as np
+
+    n = 253
+    ids = [f"PV{i:03d}" for i in range(1, n + 1)]
+    sites = pd.DataFrame(
+        {"site_id": ids, "capacity_kw": [200.0] * n,
+         "lat": 33.0 + (np.arange(n) % 23) * 0.1, "lon": 124.0 + (np.arange(n) // 23) * 0.1,
+         "current_group": ["A" if i % 2 == 0 else "B" for i in range(n)]}
+    )
+    sites.to_parquet(canon / "sites.parquet", index=False)
+    monkeypatch.setattr(pipeline_mod, "DataPaths", lambda *a, **k: DataPaths(canonical_dir=canon))
+    paths = ArtifactPaths(root=tmp_path, registry=tmp_path / "registry.jsonl",
+                          submissions=tmp_path / "subs", runs=tmp_path / "runs", compositions=comps)
+    monkeypatch.setattr(store_mod, "ArtifactPaths", lambda *a, **k: paths)
+    assert main(["compose", "--comp-id", "t1"]) == 0
+    before_csv = (comps / "t1.csv").read_bytes()
+    before_json = (comps / "t1.json").read_bytes()
+    with pytest.raises(CompositionError):
+        main(["compose", "--comp-id", "t1"])
+    assert (comps / "t1.csv").read_bytes() == before_csv
+    assert (comps / "t1.json").read_bytes() == before_json
+
+
+def test_pipeline_validate_run_passes_composition(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(runner_mod, "run_validation", lambda cfg: calls.append(cfg))
+    assert main(["validate-run", "--run-id", "r1", "--hypothesis", "h", "--composition", "t1"]) == 0
+    assert calls[0].composition_id == "t1"
+
+
+@pytest.mark.parametrize("defect", ["before", "during", "null"])
+def test_pipeline_submit_rejects_composition_hash_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str,
+) -> None:
+    import hashlib
+    from datetime import UTC, datetime
+
+    import src.oibc.pipeline as pipeline_mod
+    from src.oibc.compose import store as store_mod
+    from src.oibc.config import ArtifactPaths, ComposeConfig, DataPaths, RunConfig
+    from src.oibc.compose.store import assignment_sha256, write_composition
+    from src.oibc.evaluate import registry as registry_mod
+    from src.oibc.evaluate.registry import ExperimentRecord
+    from src.oibc.submit import build as build_mod
+
+    canon = tmp_path / "canonical"
+    canon.mkdir(exist_ok=True)
+    comps = tmp_path / "comps"
+    import numpy as np
+
+    n = 253
+    ids = [f"PV{i:03d}" for i in range(1, n + 1)]
+    sites = pd.DataFrame(
+        {"site_id": ids, "capacity_kw": [200.0] * n,
+         "lat": 33.0 + (np.arange(n) % 23) * 0.1, "lon": 124.0 + (np.arange(n) // 23) * 0.1,
+         "current_group": ["A" if i % 2 == 0 else "B" for i in range(n)]}
+    )
+    sites.to_parquet(canon / "sites.parquet", index=False)
+    paths = ArtifactPaths(root=tmp_path, registry=tmp_path / "registry.jsonl",
+                          submissions=tmp_path / "subs", runs=tmp_path / "runs", compositions=comps)
+    monkeypatch.setattr(pipeline_mod, "DataPaths", lambda *a, **k: DataPaths(canonical_dir=canon))
+    monkeypatch.setattr(store_mod, "ArtifactPaths", lambda *a, **k: paths)
+    half = n // 2
+    assignment = pd.DataFrame({"site_id": ids, "group": ["G1"] * half + ["G2"] * (n - half)})
+    write_composition(assignment, "t1", ComposeConfig(), sites, paths=paths)
+    panel_path = tmp_path / "panel.parquet"
+    panel_path.write_bytes(b"validated panel")
+    cfg = RunConfig(run_id="r1", hypothesis="h", composition_id="t1")
+    config = cfg.model_dump(mode="json") | {
+        "panel_path": str(panel_path), "panel_sha256": hashlib.sha256(panel_path.read_bytes()).hexdigest(),
+        "composition_sha256": None if defect == "null" else assignment_sha256(assignment),
+        "competition": CompetitionSpec().model_dump(mode="json"),
+    }
+    rec = ExperimentRecord(
+        run_id="r1", created_at=datetime(2026, 1, 1, tzinfo=UTC), hypothesis="h", config=config,
+        git_commit=None, seeds=tuple(cfg.model.seeds), folds=("A",),
+        metrics={}, comparison={"bag": {"A": {"W_all": 1.0, "W_warm": 0.5}}},
+    )
+    monkeypatch.setattr(registry_mod, "read_records", lambda *a, **k: [rec])
+
+    def replace_composition():
+        (comps / "t1.csv").unlink()
+        (comps / "t1.json").unlink()
+        changed = assignment.copy()
+        changed.loc[[0, half], "group"] = ["G2", "G1"]
+        write_composition(changed, "t1", ComposeConfig(), sites, paths=paths)
+
+    if defect == "before":
+        replace_composition()
+
+    def predict(*args, **kwargs):
+        assert defect == "during", "배정 검증 전에 예측 실행"
+        replace_composition()
+        return pd.DataFrame()
+
+    monkeypatch.setattr(runner_mod, "forecast_eval", predict)
+    monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: pytest.fail("drift 이전에 실패해야 함"))
+    with pytest.raises(runner_mod.RunnerError, match="composition"):
+        main(["submit", "--run-id", "r1", "--sub-id", "s1"])
+
+
+def test_pipeline_submit_legacy_reference_record_allowed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import hashlib
+    from datetime import UTC, datetime
+
+    import src.oibc.pipeline as pipeline_mod
+    from src.oibc.config import CompetitionSpec, DataPaths, RunConfig
+    from src.oibc.evaluate import registry as registry_mod
+    from src.oibc.evaluate.registry import ExperimentRecord
+    from src.oibc.submit import build as build_mod
+
+    panel_path = tmp_path / "panel.parquet"
+    panel_path.write_bytes(b"validated panel")
+    cfg = RunConfig(run_id="r1", hypothesis="h")
+    config = cfg.model_dump(mode="json")
+    config.pop("composition_id")
+    config |= {
+        "panel_path": str(panel_path), "panel_sha256": hashlib.sha256(panel_path.read_bytes()).hexdigest(),
+        "competition": CompetitionSpec().model_dump(mode="json"),
+    }
+    rec = ExperimentRecord(
+        run_id="r1", created_at=datetime(2026, 1, 1, tzinfo=UTC), hypothesis="h", config=config,
+        git_commit=None, seeds=tuple(cfg.model.seeds), folds=("A",),
+        metrics={}, comparison={"bag": {"A": {"W_all": 1.0, "W_warm": 0.5}}},
+    )
+    monkeypatch.setattr(registry_mod, "read_records", lambda *a, **k: [rec])
+    monkeypatch.setattr(runner_mod, "forecast_eval", lambda *a, **k: pd.DataFrame({"ok": [1]}))
+    monkeypatch.setattr(
+        pd, "read_parquet",
+        lambda *a, **k: pd.DataFrame({"site_id": ["s"], "current_group": ["A"]}),
+    )
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(
+        runner_mod, "resolve_composition",
+        lambda *a, **k: (pd.DataFrame({"site_id": ["s"], "group": ["G1"]}), "abc"),
+    )
+    assert main(["submit", "--run-id", "r1", "--sub-id", "s1"]) == 0
+    assert len(calls) == 1
+
+
+def test_pipeline_submit_missing_sha_non_reference_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+    from datetime import UTC, datetime
+
+    from src.oibc.config import CompetitionSpec, RunConfig
+    from src.oibc.evaluate import registry as registry_mod
+    from src.oibc.evaluate.registry import ExperimentRecord
+    from src.oibc.submit import build as build_mod
+
+    panel_path = tmp_path / "panel.parquet"
+    panel_path.write_bytes(b"validated panel")
+    cfg = RunConfig(run_id="r1", hypothesis="h", composition_id="t1")
+    config = cfg.model_dump(mode="json") | {
+        "panel_path": str(panel_path), "panel_sha256": hashlib.sha256(panel_path.read_bytes()).hexdigest(),
+        "competition": CompetitionSpec().model_dump(mode="json"),
+    }
+    assert "composition_sha256" not in config
+    rec = ExperimentRecord(
+        run_id="r1", created_at=datetime(2026, 1, 1, tzinfo=UTC), hypothesis="h", config=config,
+        git_commit=None, seeds=tuple(cfg.model.seeds), folds=("A",),
+        metrics={}, comparison={"bag": {"A": {"W_all": 1.0, "W_warm": 0.5}}},
+    )
+    monkeypatch.setattr(registry_mod, "read_records", lambda *a, **k: [rec])
+    monkeypatch.setattr(runner_mod, "forecast_eval", lambda *a, **k: pd.DataFrame({"ok": [1]}))
+    monkeypatch.setattr(
+        pd, "read_parquet",
+        lambda *a, **k: pd.DataFrame({"site_id": ["s"], "current_group": ["A"]}),
+    )
+    monkeypatch.setattr(
+        runner_mod, "resolve_composition",
+        lambda *a, **k: (pd.DataFrame({"site_id": ["s"], "group": ["G1"]}), "abc"),
+    )
+    monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: pytest.fail("sha 없이 제출 진행"))
+    with pytest.raises(runner_mod.RunnerError, match="composition_sha256"):
+        main(["submit", "--run-id", "r1", "--sub-id", "s1"])

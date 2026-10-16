@@ -365,10 +365,11 @@ class RunConfig(BaseModel):
     features: FeatureConfig = FeatureConfig()
     model: ModelConfig = ModelConfig()
     baseline_run_id: str | None = None
+    composition_id: str = REFERENCE_COMP_ID
     note: str = ""
     allow_commit_drift: bool = False
 
-    @field_validator("run_id", "baseline_run_id")
+    @field_validator("run_id", "baseline_run_id", "composition_id")
     @classmethod
     def _check_run_id(cls, v: str | None) -> str | None:
         if v is not None and (not v or v in {".", ".."} or _RUN_ID.fullmatch(v) is None):

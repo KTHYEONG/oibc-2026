@@ -425,6 +425,86 @@ def test_site_frame_guards() -> None:
     assert len(out) == 5
 
 
+def test_site_frame_columnar_equivalence_shuffled() -> None:
+    ts11 = pd.Timestamp("2023-01-10 11:00", tz=KST)
+    ts12 = pd.Timestamp("2023-01-10 12:00", tz=KST)
+    ts00 = pd.Timestamp("2023-01-10 00:00", tz=KST)
+    day = pd.DataFrame(
+        {
+            "site_id": ["PV002", "PV001", "PV002", "PV001"],
+            "ts": [ts11, ts12, ts12, ts11],
+            "energy": [30.0, 20.0, 40.0, 10.0],
+        }
+    )
+    pred = np.array([29.0, 19.0, 39.0, 9.0])
+    night = pd.DataFrame(
+        {"site_id": ["PV002", "PV001"], "ts": [ts00, ts00], "energy": [1.0, 5.0]}
+    )
+    day.index = [8, 2, 6, 4]
+    night.index = [6, 2]
+    out = site_frame(day, pred, night)
+    expected = pd.DataFrame(
+        {
+            "site_id": pd.Series(["PV001", "PV001", "PV001", "PV002", "PV002", "PV002"], dtype="string"),
+            "ts": pd.Series(
+                pd.DatetimeIndex([ts00, ts11, ts12, ts00, ts11, ts12]).as_unit("us"), dtype=_DT
+            ),
+            "pred_kwh": pd.Series([0.0, 9.0, 19.0, 0.0, 29.0, 39.0], dtype="float64"),
+            "actual_kwh": pd.Series([5.0, 10.0, 20.0, 1.0, 30.0, 40.0], dtype="float64"),
+        }
+    )
+    pd.testing.assert_frame_equal(out, expected, check_exact=True)
+
+
+def test_site_frame_mixed_timestamp_units() -> None:
+    day, pred, night = _day_night()
+    day_ms = day.copy()
+    day_ms["ts"] = pd.Series(pd.DatetimeIndex(day["ts"]).as_unit("ms"))
+    night_us = night.copy()
+    night_us["ts"] = pd.Series(pd.DatetimeIndex(night["ts"]).as_unit("us"))
+    out = site_frame(day_ms, pred, night_us)
+    expected = pd.DataFrame(
+        {
+            "site_id": pd.Series(["PV001"] * 5, dtype="string"),
+            "ts": pd.Series(
+                pd.DatetimeIndex(
+                    ["2023-01-10 00:00", "2023-01-10 01:00", "2023-01-10 11:00",
+                     "2023-01-10 12:00", "2023-01-10 13:00"], tz=KST,
+                ), dtype=_DT,
+            ),
+            "pred_kwh": [0.0, 0.0, 9.0, 19.0, 29.0],
+            "actual_kwh": [5.0, 0.0, 10.0, 20.0, 30.0],
+        }
+    )
+    pd.testing.assert_frame_equal(out, expected, check_exact=True)
+
+
+@pytest.mark.parametrize("empty_part", ["day", "night", "both"])
+@pytest.mark.parametrize("empty_ts_dtype", ["object", "datetime64[ns]", _DT])
+def test_site_frame_empty_part(empty_part: str, empty_ts_dtype: str) -> None:
+    day, pred, night = _day_night()
+    if empty_part in ("day", "both"):
+        day = pd.DataFrame({"site_id": pd.Series(dtype="string"), "ts": pd.Series(dtype=empty_ts_dtype)})
+        pred = np.empty(0, dtype="float64")
+    if empty_part in ("night", "both"):
+        night = pd.DataFrame({"site_id": pd.Series(dtype="string"), "ts": pd.Series(dtype=empty_ts_dtype)})
+    expected = pd.DataFrame(
+        {
+            "site_id": pd.Series(dtype="string"),
+            "ts": pd.Series(dtype=_DT),
+            "pred_kwh": pd.Series(dtype="float64"),
+            "actual_kwh": pd.Series(dtype="float64"),
+        }
+    )
+    if len(day):
+        expected = day.rename(columns={"energy": "actual_kwh"}).assign(pred_kwh=pred)
+    elif len(night):
+        expected = night.rename(columns={"energy": "actual_kwh"}).assign(pred_kwh=0.0)
+    expected["site_id"] = expected["site_id"].astype("string")
+    expected = expected[["site_id", "ts", "pred_kwh", "actual_kwh"]].reset_index(drop=True)
+    pd.testing.assert_frame_equal(site_frame(day, pred, night), expected, check_exact=True)
+
+
 def test_load_daily_runs_guards(tmp_path: Path) -> None:
     panel = _make_panel(tmp_path)
     paths = _paths(tmp_path)

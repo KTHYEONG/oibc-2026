@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 
 import lightgbm as lgb
 import numpy as np
@@ -45,7 +46,15 @@ def _capacity(panel: pd.DataFrame) -> np.ndarray:
 def _features(panel: pd.DataFrame, features: Sequence[str]) -> np.ndarray:
     if not features or len(set(features)) != len(features):
         raise ModelError("features must be non-empty and distinct")
-    data = _numeric(panel, features)
+    _require_columns(panel, features)
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            data = panel.loc[:, list(features)].to_numpy(dtype="float32", copy=False)
+        data = np.asarray(data, dtype=np.float32)
+        if not data.flags["C_CONTIGUOUS"]:
+            data = np.ascontiguousarray(data, dtype=np.float32)
+    except (ValueError, TypeError) as exc:
+        raise ModelError("columns must be numeric") from exc
     if np.isinf(data).any():
         raise ModelError("features must not contain infinity")
     return data
@@ -82,15 +91,20 @@ def sample_weight(panel: pd.DataFrame, cfg: ModelConfig) -> np.ndarray:
 
 
 def fit_seed_models(train: pd.DataFrame, features: Sequence[str], cfg: ModelConfig) -> list[lgb.Booster]:
-    """cfg.seeds 순서대로 시드별 LightGBM을 학습해 반환한다."""
+    """cfg.seeds 순서의 시드별 LightGBM을 시드마다 독립 Dataset으로 (동시) 학습해 반환한다."""
     if train.empty:
         raise ModelError("train must not be empty")
     data = _features(train, features)
     target = training_target(train, cfg)
     weight = sample_weight(train, cfg)
-    dataset = lgb.Dataset(data, label=target, weight=weight, free_raw_data=False)
-    models: list[lgb.Booster] = []
-    for seed in cfg.seeds:
+    data.flags.writeable = False
+    target.flags.writeable = False
+    weight.flags.writeable = False
+    workers = min(cfg.seed_workers, len(cfg.seeds), cfg.n_jobs)
+    threads = max(1, cfg.n_jobs // workers)
+    n_rows, n_feats = data.shape
+
+    def _fit_one(seed: int) -> lgb.Booster:
         params: dict[str, object] = {
             "objective": cfg.objective,
             "learning_rate": cfg.learning_rate,
@@ -100,29 +114,45 @@ def fit_seed_models(train: pd.DataFrame, features: Sequence[str], cfg: ModelConf
             "subsample_freq": cfg.subsample_freq,
             "colsample_bytree": cfg.colsample_bytree,
             "reg_lambda": cfg.reg_lambda,
-            "num_threads": cfg.n_jobs,
+            "num_threads": threads,
             "seed": seed,
             "verbose": -1,
         }
+        dataset = lgb.Dataset(data, label=target, weight=weight, free_raw_data=False)
         t0 = time.perf_counter()
         booster = lgb.train(params, dataset, num_boost_round=cfg.n_rounds)
         sec = time.perf_counter() - t0
-        logger.info("[FCST] fit seed=%d rows=%d feats=%d sec=%.1f", seed, len(train), len(features), sec)
-        models.append(booster)
+        logger.info("[FCST] fit seed=%d rows=%d feats=%d threads=%d sec=%.1f", seed, n_rows, n_feats, threads, sec)
+        return booster
+
+    t_all = time.perf_counter()
+    if workers <= 1:
+        models = [_fit_one(seed) for seed in cfg.seeds]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            models = list(pool.map(_fit_one, cfg.seeds))
+    logger.info("[FCST] fit_all seeds=%d workers=%d sec=%.1f", len(cfg.seeds), workers, time.perf_counter() - t_all)
     return models
 
 
-def predict_seed_kwh(models: Sequence[lgb.Booster], frame: pd.DataFrame, features: Sequence[str]) -> np.ndarray:
-    """(n_seeds, n_rows) 발전소 kWh 예측(≥0, 유한)을 반환한다."""
+def predict_seed_kwh(
+    models: Sequence[lgb.Booster], frame: pd.DataFrame, features: Sequence[str], *, num_threads: int | None = None,
+) -> np.ndarray:
+    """(n_seeds, n_rows) 발전소 kWh 예측(≥0, 유한)을 반환한다. num_threads는 예측 스레드 수(None이면 모델 설정)."""
     if len(models) == 0:
         raise ModelError("models must not be empty")
+    if num_threads is not None and num_threads < 1:
+        raise ModelError("num_threads must be >= 1")
     data = _features(frame, features)
     cap = _capacity(frame)
     rows = np.empty((len(models), len(frame)), dtype="float64")
     if frame.empty:
         return rows
     for i, model in enumerate(models):
-        pred = np.asarray(model.predict(data), dtype="float64")
+        pred = np.asarray(
+            model.predict(data) if num_threads is None else model.predict(data, num_threads=num_threads),
+            dtype="float64",
+        )
         if pred.shape != (len(frame),) or not np.isfinite(pred).all():
             raise ModelError("prediction must be a finite row vector")
         with np.errstate(over="ignore", invalid="ignore"):

@@ -354,3 +354,14 @@ def test_run_config_legacy_record_loads() -> None:
     data = RunConfig(run_id="r1", hypothesis="h").model_dump(mode="json")
     data.pop("composition_id")
     assert RunConfig.model_validate(data).composition_id == "current_group"
+
+
+def test_model_config_seed_workers_lower_bound() -> None:
+    with pytest.raises(ValidationError, match="seed_workers"):
+        ModelConfig(seed_workers=0)
+
+
+def test_model_config_seed_workers_defaults() -> None:
+    cfg = ModelConfig()
+    assert cfg.seed_workers == 3
+    assert cfg.n_jobs == 6

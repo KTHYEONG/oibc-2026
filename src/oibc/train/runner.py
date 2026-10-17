@@ -566,7 +566,7 @@ def run_validation(
         t0 = time.perf_counter()
         models = fit_seed_models(train_fold, features, cfg.model)
         fit_sec = time.perf_counter() - t0
-        preds = predict_seed_kwh(models, test_day, features)
+        preds = predict_seed_kwh(models, test_day, features, num_threads=cfg.model.n_jobs)
         night_mask = (night_all["op_date"] >= fold.test_start) & (night_all["op_date"] <= fold.test_end)
         night_fold = night_all.loc[night_mask].reset_index(drop=True)
         test_ts = pd.DatetimeIndex(test_day["ts"].unique()).union(
@@ -773,7 +773,7 @@ def forecast_eval(
     if not _key_index(eval_day).sort_values().equals(expected_day.sort_values()):
         raise RunnerError("panel: missing or unexpected evaluation daylight rows")
     models = fit_seed_models(train, features, cfg.model)
-    preds = predict_seed_kwh(models, eval_day, features)
+    preds = predict_seed_kwh(models, eval_day, features, num_threads=cfg.model.n_jobs)
     mean = bag(preds)
     if mean.shape != (len(eval_day),) or not np.isfinite(mean).all() or (mean < 0).any():
         raise RunnerError("forecast: invalid seed-bag predictions")

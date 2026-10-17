@@ -318,6 +318,7 @@ class ModelConfig(BaseModel):
     reg_lambda: float = 0.0
     n_rounds: int = 500
     n_jobs: int = 6
+    seed_workers: int = 3
     seeds: tuple[int, ...] = (0, 1, 2)
     weight: Literal["smp_k_cap", "k_cap", "none"] = "smp_k_cap"
     target_clip_max: float = 1.2
@@ -338,6 +339,8 @@ class ModelConfig(BaseModel):
             raise ValueError("n_rounds must be >= 1")
         if self.n_jobs < 1:
             raise ValueError("n_jobs must be >= 1")
+        if self.seed_workers < 1:
+            raise ValueError("seed_workers must be >= 1")
         if not 0.0 < self.subsample <= 1.0:
             raise ValueError("subsample must be in (0, 1]")
         if not 0.0 < self.colsample_bytree <= 1.0:

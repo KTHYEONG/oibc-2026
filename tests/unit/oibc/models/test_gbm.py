@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 from src.oibc.config import ModelConfig
-from src.oibc.models.gbm import ModelError, bag, fit_seed_models, predict_seed_kwh, sample_weight, training_target
+from src.oibc.models.gbm import ModelError, _features, bag, fit_seed_models, predict_seed_kwh, sample_weight, training_target
 
 FEATURES = ["f0", "f1", "f2"]
 
@@ -189,3 +189,133 @@ def test_prediction_overflow_rejected() -> None:
 
     with pytest.raises(ModelError, match="prediction must be finite"):
         predict_seed_kwh([HugeModel()], _panel(), FEATURES)  # type: ignore[list-item]
+
+
+def test_concurrent_training_matches_sequential() -> None:
+    train = _panel()
+    seq = predict_seed_kwh(
+        fit_seed_models(train, FEATURES, _cfg(seeds=(0, 1, 2), seed_workers=1, n_jobs=1)),
+        train, FEATURES,
+    )
+    par = predict_seed_kwh(
+        fit_seed_models(train, FEATURES, _cfg(seeds=(0, 1, 2), seed_workers=3, n_jobs=3)),
+        train, FEATURES,
+    )
+    assert np.array_equal(seq, par)
+
+
+@pytest.mark.parametrize("seed_workers", [1, 2])
+def test_seed_dataset_independent(seed_workers: int) -> None:
+    train = _panel()
+    pair = predict_seed_kwh(
+        fit_seed_models(train, FEATURES, _cfg(seeds=(0, 1), seed_workers=seed_workers, n_jobs=2)),
+        train, FEATURES,
+    )
+    solo = predict_seed_kwh(
+        fit_seed_models(train, FEATURES, _cfg(seeds=(1,), seed_workers=1, n_jobs=1)),
+        train, FEATURES,
+    )
+    assert np.array_equal(pair[1], solo[0])
+
+
+def test_seed_order_preserved() -> None:
+    train = _panel()
+    models = fit_seed_models(train, FEATURES, _cfg(seeds=(2, 0), seed_workers=2, n_jobs=2))
+    preds = predict_seed_kwh(models, train, FEATURES)
+    for i, seed in enumerate((2, 0)):
+        solo = predict_seed_kwh(
+            fit_seed_models(train, FEATURES, _cfg(seeds=(seed,), seed_workers=1, n_jobs=1)),
+            train, FEATURES,
+        )
+        assert np.array_equal(preds[i], solo[0])
+
+
+def test_features_float32_contiguous_nan() -> None:
+    frame = _panel(n=50)
+    frame.loc[::5, "f0"] = np.nan
+    out = _features(frame, FEATURES)
+    assert out.dtype == np.float32
+    assert out.flags["C_CONTIGUOUS"]
+    assert np.isnan(out[::5, 0]).all()
+
+
+def test_features_float32_overflow_rejected() -> None:
+    bad = _panel(n=50)
+    bad.loc[0, "f0"] = 1e39
+    with pytest.raises(ModelError):
+        fit_seed_models(bad, FEATURES, _cfg())
+
+
+def test_predict_threads_invariant() -> None:
+    train = _panel()
+    models = fit_seed_models(train, FEATURES, _cfg())
+    first = predict_seed_kwh(models, train, FEATURES, num_threads=1)
+    second = predict_seed_kwh(models, train, FEATURES, num_threads=2)
+    assert np.array_equal(first, second)
+
+
+def test_predict_threads_lower_bound() -> None:
+    train = _panel(n=50)
+    models = fit_seed_models(train, FEATURES, _cfg())
+    with pytest.raises(ModelError):
+        predict_seed_kwh(models, train, FEATURES, num_threads=0)
+
+
+def test_concurrent_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.models.gbm as gbm_mod
+
+    real_train = gbm_mod.lgb.train
+    failure = RuntimeError("boom-seed-2")
+
+    def _fail_once(params, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if params["seed"] == 1:
+            raise failure
+        return real_train(params, *args, **kwargs)
+
+    monkeypatch.setattr(gbm_mod.lgb, "train", _fail_once)
+    with pytest.raises(RuntimeError, match="boom-seed-2") as exc:
+        fit_seed_models(_panel(n=100), FEATURES, _cfg(seeds=(0, 1), seed_workers=2, n_jobs=2))
+    assert exc.value is failure
+
+
+@pytest.mark.parametrize(
+    ("seed_workers", "n_jobs", "seeds", "workers", "threads"),
+    [(8, 6, (0, 1), 2, 3), (8, 2, (0, 1, 2), 2, 1), (2, 5, (0, 1, 2), 2, 2)],
+)
+def test_training_respects_thread_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    seed_workers: int,
+    n_jobs: int,
+    seeds: tuple[int, ...],
+    workers: int,
+    threads: int,
+) -> None:
+    from threading import Barrier, Lock
+
+    import src.oibc.models.gbm as gbm_mod
+
+    real_train = gbm_mod.lgb.train
+    barrier = Barrier(workers, timeout=10)
+    lock = Lock()
+    datasets = []
+    inputs = []
+
+    def checked_train(params, dataset, **kwargs):  # type: ignore[no-untyped-def]
+        assert params["num_threads"] == threads
+        with lock:
+            datasets.append(dataset)
+            inputs.append((dataset.data, dataset.label, dataset.weight))
+            first_batch = len(datasets) <= workers
+        if first_batch:
+            barrier.wait()
+        return real_train(params, dataset, **kwargs)
+
+    monkeypatch.setattr(gbm_mod.lgb, "train", checked_train)
+    models = fit_seed_models(
+        _panel(), FEATURES, _cfg(seeds=seeds, seed_workers=seed_workers, n_jobs=n_jobs),
+    )
+    assert len(models) == len(seeds)
+    assert len({id(dataset) for dataset in datasets}) == len(seeds)
+    for arrays in zip(*inputs, strict=True):
+        assert all(array is arrays[0] for array in arrays)
+        assert not arrays[0].flags.writeable

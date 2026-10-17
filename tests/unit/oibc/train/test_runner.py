@@ -110,7 +110,25 @@ def _paths(tmp_path: Path) -> ArtifactPaths:
     )
 
 
+_PANEL_BYTES: dict[str, bytes] = {}
+_PANEL_REL_PATHS = (
+    "panel.parquet",
+    "canonical/sites.parquet",
+    "canonical/generation.parquet",
+    "canonical/smp.parquet",
+    "derived/grid.parquet",
+    "derived/solar.parquet",
+)
+
+
 def _make_panel(tmp_path: Path) -> Path:
+    path = tmp_path / "panel.parquet"
+    if _PANEL_BYTES:
+        for rel, data in _PANEL_BYTES.items():
+            target = tmp_path / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        return path
     feat = _feat()
     extra = [f"{v}_r{r}" for v in (*feat.wa_vars, *feat.wb_vars) for r in (10, 17)]
     rows: list[dict[str, object]] = []
@@ -174,7 +192,6 @@ def _make_panel(tmp_path: Path) -> Path:
     panel["op_date"] = op_date(panel["ts"]).astype(_DT)
     panel["period"] = panel["period"].astype("string")
     panel["current_group"] = panel["current_group"].astype("string")
-    path = tmp_path / "panel.parquet"
     panel.to_parquet(path, index=False)
     canonical = tmp_path / "canonical"
     derived = tmp_path / "derived"
@@ -200,6 +217,8 @@ def _make_panel(tmp_path: Path) -> Path:
     smp["k"] = np.where(smp["ts"].dt.hour.isin([11, 12, 13, 14, 15]), 3, 1)
     smp["period"] = np.where(smp["ts"] <= _spec().train_end, "train", "eval")
     smp.to_parquet(canonical / "smp.parquet", index=False)
+    for rel in _PANEL_REL_PATHS:
+        _PANEL_BYTES[rel] = (tmp_path / rel).read_bytes()
     return path
 
 
@@ -1881,3 +1900,164 @@ def test_pipeline_netting_synthetic_roundtrip(tmp_path: Path, monkeypatch: pytes
     with pytest.raises(FileExistsError):
         pipeline.main(args)
     assert output.read_bytes() == payload
+
+
+def _regional_cfg(run_id: str, weight: float = 0.6) -> RunConfig:
+    from src.oibc.config import RegionalConfig
+
+    return _cfg(
+        run_id,
+        model=ModelConfig(
+            n_rounds=3, num_leaves=4, n_jobs=1, min_child_samples=5, seeds=(0, 1),
+            regional=RegionalConfig(
+                weight=weight, units=((1, 0), (2, 0)), kmeans_n_init=1,
+                num_leaves=4, min_child_samples=5, n_rounds=3,
+            ),
+        ),
+    )
+
+
+def test_run_validation_zero_weight_bit_identical(tmp_path: Path) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+    run_validation(_regional_cfg("w0", weight=0.0), panel_path=panel, vcfg=vcfg, paths=paths, save_oof=True)
+    run_validation(_cfg("plain"), panel_path=panel, vcfg=vcfg, paths=paths, save_oof=True)
+    for fold in ("A", "B"):
+        left = load_oof("w0", fold, paths=paths)
+        right = load_oof("plain", fold, paths=paths)
+        for col in ("pred_s0", "pred_s1", "pred_bag"):
+            np.testing.assert_array_equal(left[col].to_numpy(), right[col].to_numpy())
+    from src.oibc.evaluate.registry import read_records
+
+    rec = next(r for r in read_records(paths.registry) if r.run_id == "w0")
+    assert all("regional_sec" not in m for m in rec.metrics.values())
+
+
+def test_run_validation_blend_applied_to_oof(tmp_path: Path) -> None:
+    from src.oibc.models.regional import site_units
+
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+    cfg_w = _regional_cfg("blend", weight=0.6)
+    run_validation(_regional_cfg("base0", weight=0.0), panel_path=panel, vcfg=vcfg, paths=paths, save_oof=True)
+    run_validation(cfg_w, panel_path=panel, vcfg=vcfg, paths=paths, save_oof=True)
+    oof0 = load_oof("base0", "A", paths=paths)
+    oofw = load_oof("blend", "A", paths=paths)
+    merged = oof0[["site_id", "ts", "pred_bag"]].merge(
+        oofw[["site_id", "ts", "pred_bag"]], on=["site_id", "ts"], suffixes=("_0", "_w")
+    )
+    night = merged.loc[~merged["ts"].dt.hour.isin([11, 12, 13])]
+    assert len(night) > 0
+    assert bool((merged["pred_bag_w"] == 0.0).loc[merged.index.isin(night.index)].all())
+    day = merged.loc[merged["ts"].dt.hour.isin([11, 12, 13])].copy()
+    assert len(day) > 0
+    assert bool(((day["pred_bag_w"] - 0.4 * day["pred_bag_0"]) >= -1e-9).all())
+    assert bool((day["pred_bag_w"] != day["pred_bag_0"]).any())
+    day["reg"] = (day["pred_bag_w"] - 0.4 * day["pred_bag_0"]) / 0.6
+    geo = runner_mod._site_geo(pd.read_parquet(panel))
+    units = site_units(geo, 2, 0, cfg_w.model.regional)
+    day["unit"] = day["site_id"].map({k: int(v) for k, v in units.items()})
+    day["ratio"] = day["reg"] / 100.0
+    for (_, _), group in day.groupby(["unit", "ts"]):
+        vals = group["ratio"].to_numpy()
+        assert vals.max() - vals.min() <= 1e-9 * max(1.0, abs(vals).max())
+
+
+def test_run_validation_records_regional_config(tmp_path: Path) -> None:
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    run_validation(_regional_cfg("reg"), panel_path=panel, vcfg=_vcfg(), paths=paths)
+    from src.oibc.evaluate.registry import read_records
+
+    rec = next(r for r in read_records(paths.registry) if r.run_id == "reg")
+    assert rec.config["model"]["regional"]["weight"] == 0.6
+    assert rec.metrics and all(
+        np.isfinite(m["regional_sec"]) and m["regional_sec"] >= 0 for m in rec.metrics.values()
+    )
+
+
+def test_config_diff_reports_regional(tmp_path: Path) -> None:
+    import copy
+
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    run_validation(_cfg("base"), panel_path=panel, vcfg=_vcfg(), paths=paths)
+    from src.oibc.evaluate.registry import read_records
+
+    record = next(r for r in read_records(paths.registry) if r.run_id == "base")
+    config = copy.deepcopy(record.config)
+    config["model"].pop("regional")
+    legacy = record.model_copy(update={"config": config})
+    assert "model.regional" in runner_mod._config_diff_keys(legacy, _regional_cfg("cand"))
+
+
+def test_forecast_eval_regional_contract(tmp_path: Path) -> None:
+    panel = _make_panel(tmp_path)
+    spec = _spec()
+    out = forecast_eval(_regional_cfg("r1"), panel_path=panel, spec=spec)
+    assert len(out) == 2 * spec.n_eval_hours
+    assert np.isfinite(out["forecast_kwh"].to_numpy()).all() and (out["forecast_kwh"] >= 0).all()
+    eval_ts = pd.date_range(spec.eval_start, spec.eval_end, freq="h").as_unit("us")
+    for group in ("G1", "G2"):
+        got = pd.DatetimeIndex(out.loc[out["group"] == group, "ts"]).sort_values()
+        assert got.equals(eval_ts)
+    base = forecast_eval(_cfg("r0"), panel_path=panel, spec=spec)
+    merged = out.merge(base, on=["group", "ts"], suffixes=("_w", "_0"))
+    assert bool((merged["forecast_kwh_w"] != merged["forecast_kwh_0"]).any())
+
+
+def test_forecast_eval_no_future_leak_regional(tmp_path: Path) -> None:
+    panel = _make_panel(tmp_path)
+    cfg = _regional_cfg("r1")
+    before = forecast_eval(cfg, panel_path=panel, spec=_spec())
+    gen_path = tmp_path / "canonical" / "generation.parquet"
+    gen = pd.read_parquet(gen_path)
+    gen["energy"] = gen["energy"] * 100.0
+    gen.to_parquet(gen_path, index=False)
+    after = forecast_eval(cfg, panel_path=panel, spec=_spec())
+    pd.testing.assert_frame_equal(before, after)
+
+
+def test_site_geo_inconsistent_rejected() -> None:
+    frame = pd.DataFrame(
+        {
+            "site_id": ["a", "a", "b"],
+            "lat": [1.0, 2.0, 1.0],
+            "lon": [0.0, 0.0, 0.0],
+            "capacity_kw": [1.0, 1.0, 1.0],
+        }
+    )
+    with pytest.raises(RunnerError):
+        runner_mod._site_geo(frame)
+
+
+@pytest.mark.parametrize("defect", ["missing_col", "empty", "null_id", "empty_id", "nonfinite_lat", "nonpositive_cap"])
+def test_site_geo_guards(defect: str) -> None:
+    base = pd.DataFrame(
+        {
+            "site_id": ["a", "a", "b"],
+            "lat": [1.0, 1.0, 2.0],
+            "lon": [0.0, 0.0, 0.0],
+            "capacity_kw": [1.0, 1.0, 1.0],
+        }
+    )
+    if defect == "missing_col":
+        frame = base.drop(columns=["lat"])
+    elif defect == "empty":
+        frame = base.iloc[:0]
+    elif defect == "null_id":
+        frame = base.copy()
+        frame.loc[0, "site_id"] = None
+    elif defect == "empty_id":
+        frame = base.copy()
+        frame.loc[0, "site_id"] = ""
+    elif defect == "nonfinite_lat":
+        frame = base.copy()
+        frame.loc[0, "lat"] = float("inf")
+    else:
+        frame = base.copy()
+        frame.loc[0, "capacity_kw"] = 0.0
+    with pytest.raises(RunnerError):
+        runner_mod._site_geo(frame)

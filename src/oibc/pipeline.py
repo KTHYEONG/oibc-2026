@@ -18,6 +18,7 @@ from src.oibc.config import (
     FeatureConfig,
     ModelConfig,
     QualityConfig,
+    RegionalConfig,
     RunConfig,
 )
 from src.oibc.data import derived, ingest
@@ -47,6 +48,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     val.add_argument("--weight", choices=["smp_k_cap", "k_cap", "none"], default="smp_k_cap")
     val.add_argument("--allow-commit-drift", action="store_true")
     val.add_argument("--save-oof", action="store_true")
+    val.add_argument("--regional-weight", type=float, default=0.0)
     comp_cmd = sub.add_parser("compose")
     comp_cmd.add_argument("--comp-id", required=True)
     rn = sub.add_parser("report-netting")
@@ -83,7 +85,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 baseline_run_id=args.baseline,
                 composition_id=args.composition,
                 features=FeatureConfig(groups=frozenset(groups)),
-                model=ModelConfig(weight=args.weight),
+                model=ModelConfig(weight=args.weight, regional=RegionalConfig(weight=args.regional_weight)),
                 allow_commit_drift=args.allow_commit_drift,
             ),
             save_oof=args.save_oof,

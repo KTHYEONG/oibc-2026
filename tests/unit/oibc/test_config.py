@@ -422,3 +422,40 @@ def test_regional_bounds_rejected(kwargs: dict) -> None:
 def test_regional_nonfinite_rejected(field: str, value: float) -> None:
     with pytest.raises(ValidationError, match="finite"):
         RegionalConfig(**{field: value})
+
+
+def test_calibration_defaults_contain_identity() -> None:
+    from src.oibc.config import CalibrationConfig
+
+    cfg = CalibrationConfig()
+    n_a = round((cfg.a_max - cfg.a_min) / cfg.step) + 1
+    n_b = round((cfg.b_max - cfg.b_min) / cfg.step) + 1
+    assert (n_a, n_b) == (61, 81)
+    a_vals = {round(cfg.a_min + i * cfg.step, 10) for i in range(n_a)}
+    b_vals = {round(cfg.b_min + j * cfg.step, 10) for j in range(n_b)}
+    assert 1.0 in a_vals
+    assert 0.0 in b_vals
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"a_min": 1.01},
+        {"b_max": -0.01},
+        {"step": 0.0},
+        {"step": 0.003},
+        {"cloud_vars": ()},
+        {"cloud_vars": ("wa_cloud",)},
+        {"a_min": float("nan")},
+        {"step": float("inf")},
+        {"a_min": 1.05, "a_max": 0.90},
+        {"b_min": 0.15, "b_max": -0.05},
+        {"step": 0.0001},
+        {"a_min": 0.91, "a_max": 1.03, "step": 0.04},
+    ],
+)
+def test_calibration_bounds_rejected(kwargs: dict) -> None:
+    from src.oibc.config import CalibrationConfig
+
+    with pytest.raises(ValueError, match=r"."):
+        CalibrationConfig(**kwargs)

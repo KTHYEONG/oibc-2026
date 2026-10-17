@@ -111,6 +111,27 @@ def _block_ci(
     return float(np.percentile(ratios, low_pct)), float(np.percentile(ratios, high_pct))
 
 
+def block_bootstrap_ci(cand_daily: np.ndarray, base_daily: np.ndarray, cfg: ValidationConfig) -> tuple[float, float]:
+    """운영일 순서의 일별 벌점 두 배열로 상대 ΔW의 블록 부트스트랩 CI를 반환한다. 길이·값 위반 시 CompareError."""
+    try:
+        cand = np.asarray(cand_daily, dtype="float64")
+        base = np.asarray(base_daily, dtype="float64")
+    except (ValueError, TypeError) as exc:
+        raise CompareError("daily penalties must be numeric") from exc
+    if cand.ndim != 1 or base.ndim != 1:
+        raise CompareError("daily penalties must be 1-D")
+    if cand.size < 1 or base.size < 1:
+        raise CompareError("daily penalties must not be empty")
+    if cand.shape != base.shape:
+        raise CompareError("daily penalty shapes must match")
+    if not np.all(np.isfinite(cand)) or not np.all(np.isfinite(base)):
+        raise CompareError("daily penalties must be finite")
+    if bool((cand < 0).any()) or bool((base < 0).any()):
+        raise CompareError("daily penalties must be >= 0")
+    rng = np.random.default_rng(cfg.bootstrap_seed)
+    return _block_ci(cand, base, rng, cfg)
+
+
 def _quarter_rel(
     cand: np.ndarray, base: np.ndarray, days: pd.DatetimeIndex, fold: str, reasons: list[str]
 ) -> dict[str, float]:

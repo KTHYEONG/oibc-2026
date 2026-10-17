@@ -346,3 +346,48 @@ def test_nonfinite_comparison_rejected() -> None:
             frame["penalty"] = 1e-300
     with np.errstate(over="ignore", invalid="ignore"), pytest.raises(CompareError, match="finite"):
         compare_runs(cand, base, _cfg())
+
+
+def test_block_bootstrap_ci_identity_zero() -> None:
+    from src.oibc.evaluate.compare import block_bootstrap_ci
+
+    arr = np.array([5.0, 7.0, 9.0, 11.0], dtype=np.float64)
+    assert block_bootstrap_ci(arr, arr.copy(), _cfg()) == (0.0, 0.0)
+
+
+def test_block_bootstrap_ci_uniform_shift() -> None:
+    from src.oibc.evaluate.compare import block_bootstrap_ci
+
+    base = np.array([5.0, 7.0, 9.0, 11.0], dtype=np.float64)
+    cand = 0.9 * base
+    low, high = block_bootstrap_ci(cand, base, _cfg())
+    assert low == pytest.approx(-0.1, abs=1e-12)
+    assert high == pytest.approx(-0.1, abs=1e-12)
+
+
+def test_block_bootstrap_ci_contract() -> None:
+    from src.oibc.evaluate.compare import block_bootstrap_ci
+
+    cfg = _cfg()
+    good = np.array([5.0, 7.0], dtype=np.float64)
+    with pytest.raises(CompareError):
+        block_bootstrap_ci(good[:1], good, cfg)
+    with pytest.raises(CompareError):
+        block_bootstrap_ci(np.array([-1.0, 2.0]), np.array([1.0, 2.0]), cfg)
+    with pytest.raises(CompareError):
+        block_bootstrap_ci(np.array([1.0, float("nan")]), np.array([1.0, 2.0]), cfg)
+    with pytest.raises(CompareError):
+        block_bootstrap_ci(np.array([], dtype=np.float64), np.array([], dtype=np.float64), cfg)
+    with pytest.raises(CompareError):
+        block_bootstrap_ci(np.array(["a", "b"]), np.array(["a", "b"]), cfg)
+    with pytest.raises(CompareError):
+        block_bootstrap_ci(np.ones((2, 2)), np.ones((2, 2)), cfg)
+
+
+def test_block_bootstrap_ci_deterministic() -> None:
+    from src.oibc.evaluate.compare import block_bootstrap_ci
+
+    cfg = _cfg()
+    cand = np.array([6.0, 7.0, 8.0, 9.0], dtype=np.float64)
+    base = np.array([7.0, 8.0, 9.0, 10.0], dtype=np.float64)
+    assert block_bootstrap_ci(cand, base, cfg) == block_bootstrap_ci(cand, base, cfg)

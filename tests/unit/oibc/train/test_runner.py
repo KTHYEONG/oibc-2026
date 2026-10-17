@@ -2061,3 +2061,520 @@ def test_site_geo_guards(defect: str) -> None:
         frame.loc[0, "capacity_kw"] = 0.0
     with pytest.raises(RunnerError):
         runner_mod._site_geo(frame)
+
+
+def _fleet_panel(path: Path, constant: float | None = None) -> Path:
+    panel = pd.read_parquet(path)
+    ts = pd.DatetimeIndex(panel["ts"])
+    if constant is None:
+        vals = ((ts.dayofyear * 7 + ts.hour * 13) % 80 + 10).astype(float).to_numpy()
+    else:
+        vals = np.full(len(panel), float(constant))
+    panel["wa_cloud_fleet"] = vals
+    if constant is None:
+        panel["wb_cloud_fleet"] = np.clip(vals + 5.0, 0.0, 100.0)
+    else:
+        panel["wb_cloud_fleet"] = vals
+    panel.to_parquet(path, index=False)
+    return path
+
+
+_CAL_PANEL_BYTES: bytes | None = None
+_CAL_REGISTRY_TEXT: str = ""
+_CAL_TPL_PANEL_PATH: str = ""
+_CAL_RUN_FILES: dict[str, bytes] = {}
+
+
+def _cal_artifacts(tmp_path: Path, run_id: str, *, constant: float | None = None):
+    global _CAL_PANEL_BYTES, _CAL_REGISTRY_TEXT, _CAL_TPL_PANEL_PATH
+    from src.oibc.train.runner import run_validation
+
+    panel = _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+    if constant is not None:
+        _fleet_panel(panel, constant)
+        run_validation(_cfg(run_id), panel_path=panel, vcfg=vcfg, paths=paths, save_oof=True)
+        return panel, paths, vcfg
+    if _CAL_PANEL_BYTES is None:
+        _fleet_panel(panel, None)
+        run_validation(_cfg("__cal_tpl__"), panel_path=panel, vcfg=vcfg, paths=paths, save_oof=True)
+        _CAL_PANEL_BYTES = panel.read_bytes()
+        _CAL_REGISTRY_TEXT = paths.registry.read_text(encoding="utf-8")
+        _CAL_TPL_PANEL_PATH = str(panel.resolve())
+        tpl_dir = paths.runs / "__cal_tpl__"
+        for item in tpl_dir.iterdir():
+            _CAL_RUN_FILES[item.name] = item.read_bytes()
+            item.unlink()
+        tpl_dir.rmdir()
+    else:
+        panel.write_bytes(_CAL_PANEL_BYTES)
+    run_dir = paths.runs / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    for name, data in _CAL_RUN_FILES.items():
+        (run_dir / name).write_bytes(data)
+    reg_text = _CAL_REGISTRY_TEXT.replace("__cal_tpl__", run_id).replace(_CAL_TPL_PANEL_PATH, str(panel.resolve()))
+    paths.registry.write_text(reg_text, encoding="utf-8")
+    return panel, paths, vcfg
+
+
+def _cal_run(tmp_path: Path, run_id: str = "cal", *, constant: float | None = None):
+    from src.oibc.train.runner import calibration_report
+
+    panel, paths, vcfg = _cal_artifacts(tmp_path, run_id, constant=constant)
+    return panel, paths, vcfg, calibration_report(run_id, paths=paths, vcfg=vcfg)
+
+
+def test_calibration_report_schema_and_pairs(tmp_path: Path) -> None:
+    import json
+
+    _, _, _, report = _cal_run(tmp_path)
+    assert set(report) >= {"run_id", "panel_sha256", "composition_id", "composition_sha256", "config",
+                           "cross_fit", "pooled", "production", "decision", "reasons"}
+    pairs = report["cross_fit"]
+    assert isinstance(pairs, list) and len(pairs) == 2
+    by_pair = {(p["fit"], p["apply"]): p for p in pairs}
+    assert by_pair[("A", "B")]["causal"] is True
+    assert by_pair[("B", "A")]["causal"] is False
+    for p in pairs:
+        for key in ("W_base", "W_cal", "rel_delta", "ci_low", "ci_high", "a", "b"):
+            assert np.isfinite(p[key])
+        assert isinstance(p["quarter_rel"], dict)
+    json.dumps(report, allow_nan=False)
+    assert report["decision"] in {"adopt", "reject"}
+
+
+def test_calibration_report_cross_fit_uses_other_fold(tmp_path: Path) -> None:
+    from src.oibc.train import runner as cal_mod
+
+    panel, paths, vcfg, before = _cal_run(tmp_path, run_id="calx")
+    import pandas as pd
+
+    oof_b = pd.read_parquet(paths.runs / "calx" / "B_oof.parquet")
+    oof_b["pred_bag"] = oof_b["pred_bag"] * 1.5 + 1.0
+    oof_b.to_parquet(paths.runs / "calx" / "B_oof.parquet", index=False)
+    after = cal_mod.calibration_report("calx", paths=paths, vcfg=vcfg)
+    before_ab = next(p for p in before["cross_fit"] if (p["fit"], p["apply"]) == ("A", "B"))
+    after_ab = next(p for p in after["cross_fit"] if (p["fit"], p["apply"]) == ("A", "B"))
+    assert (before_ab["a"], before_ab["b"]) == (after_ab["a"], after_ab["b"])
+    assert (after_ab["W_base"], after_ab["W_cal"]) != (before_ab["W_base"], before_ab["W_cal"])
+
+
+def test_calibration_report_identity_on_unbiased(tmp_path: Path) -> None:
+    import pandas as pd
+
+    from src.oibc.train import runner as cal_mod
+
+    _, paths, vcfg = _cal_artifacts(tmp_path, "cali")
+    for fold in ("A", "B"):
+        path = paths.runs / "cali" / f"{fold}_oof.parquet"
+        oof = pd.read_parquet(path)
+        oof["pred_bag"] = oof["actual_kwh"]
+        oof.to_parquet(path, index=False)
+    report = cal_mod.calibration_report("cali", paths=paths, vcfg=vcfg)
+    for p in report["cross_fit"]:
+        assert (p["a"], p["b"]) == (1.0, 0.0)
+        assert p["rel_delta"] == 0.0
+    assert report["decision"] == "reject"
+    assert report["reasons"]
+
+
+def test_calibration_report_requires_oof_and_panel_hash(tmp_path: Path) -> None:
+    from src.oibc.train import runner as cal_mod
+
+    panel, paths, vcfg = _cal_artifacts(tmp_path, "hashok")
+    for f in (paths.runs / "hashok").glob("*_oof.parquet"):
+        f.unlink()
+    with pytest.raises(RunnerError):
+        cal_mod.calibration_report("hashok", paths=paths, vcfg=vcfg)
+    panel, paths, vcfg = _cal_artifacts(tmp_path, "hashbad")
+    frame = pd.read_parquet(panel)
+    frame.loc[0, "doy_sin"] = 0.9
+    frame.to_parquet(panel, index=False)
+    with pytest.raises(RunnerError):
+        cal_mod.calibration_report("hashbad", paths=paths, vcfg=vcfg)
+
+
+def test_calibration_report_decision_rule(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.models.calibrate import CloudCalibration
+    from src.oibc.train import runner as cal_mod
+
+    _, paths, vcfg = _cal_artifacts(tmp_path, "cald")
+    monkeypatch.setattr(
+        cal_mod, "fit_cloud_calibration",
+        lambda hourly, index, cfg, spec: CloudCalibration(a=1.0, b=0.0, at_boundary=False, n_fit_hours=1),
+    )
+    report = cal_mod.calibration_report("cald", paths=paths, vcfg=vcfg)
+    assert report["decision"] == "reject"
+    assert any("pair_not_improved" in r for r in report["reasons"])
+
+
+def test_forecast_eval_calibration_scales_daylight(tmp_path: Path) -> None:
+    from src.oibc.config import CalibrationConfig
+    from src.oibc.models.calibrate import CloudCalibration
+
+    panel = _fleet_panel(_make_panel(tmp_path), 50.0)
+    cfg = _cfg("calscale")
+    base = forecast_eval(cfg, panel_path=panel, spec=_spec())
+    cal = forecast_eval(
+        cfg, panel_path=panel, spec=_spec(),
+        calibration=CloudCalibration(a=0.98, b=0.08, at_boundary=False, n_fit_hours=1),
+        calibration_cfg=CalibrationConfig(),
+    )
+    np.testing.assert_allclose(
+        cal["forecast_kwh"].to_numpy(), base["forecast_kwh"].to_numpy() * 1.02, rtol=1e-12
+    )
+    assert (cal["forecast_kwh"] >= 0).all() and np.isfinite(cal["forecast_kwh"].to_numpy()).all()
+
+
+def test_forecast_eval_calibration_none_identical(tmp_path: Path) -> None:
+    panel = _fleet_panel(_make_panel(tmp_path), 50.0)
+    cfg = _cfg("calnone")
+    first = forecast_eval(cfg, panel_path=panel, spec=_spec())
+    second = forecast_eval(cfg, panel_path=panel, spec=_spec())
+    pd.testing.assert_frame_equal(first, second, check_exact=True)
+
+
+def test_forecast_eval_calibration_args_paired(tmp_path: Path) -> None:
+    from src.oibc.config import CalibrationConfig
+    from src.oibc.models.calibrate import CloudCalibration
+
+    panel = _fleet_panel(_make_panel(tmp_path), 50.0)
+    cfg = _cfg("calpair")
+    with pytest.raises(RunnerError):
+        forecast_eval(
+            cfg, panel_path=panel, spec=_spec(),
+            calibration=CloudCalibration(a=1.0, b=0.0, at_boundary=False, n_fit_hours=1),
+        )
+    with pytest.raises(RunnerError):
+        forecast_eval(cfg, panel_path=panel, spec=_spec(), calibration_cfg=CalibrationConfig())
+
+
+def test_forecast_eval_missing_cloud_rejected(tmp_path: Path) -> None:
+    from src.oibc.config import CalibrationConfig
+    from src.oibc.models.calibrate import CloudCalibration
+
+    panel = _fleet_panel(_make_panel(tmp_path), 50.0)
+    frame = pd.read_parquet(panel)
+    target = frame.loc[frame["period"] == "eval", "ts"].iloc[0]
+    frame.loc[frame["ts"] == target, ["wa_cloud_fleet", "wb_cloud_fleet"]] = float("nan")
+    frame.to_parquet(panel, index=False)
+    with pytest.raises(RunnerError):
+        forecast_eval(
+            _cfg("calmiss"), panel_path=panel, spec=_spec(),
+            calibration=CloudCalibration(a=0.98, b=0.08, at_boundary=False, n_fit_hours=1),
+            calibration_cfg=CalibrationConfig(),
+        )
+
+
+def test_forecast_eval_missing_calibration_columns(tmp_path: Path) -> None:
+    from src.oibc.config import CalibrationConfig
+    from src.oibc.models.calibrate import CloudCalibration
+
+    panel = _make_panel(tmp_path)
+    with pytest.raises(RunnerError, match="calibration columns"):
+        forecast_eval(
+            _cfg("cc"), panel_path=panel, spec=_spec(),
+            calibration=CloudCalibration(a=1.0, b=0.0, at_boundary=False, n_fit_hours=1),
+            calibration_cfg=CalibrationConfig(),
+        )
+
+
+def test_forecast_eval_bad_cloud_rejected(tmp_path: Path) -> None:
+    from src.oibc.config import CalibrationConfig
+    from src.oibc.models.calibrate import CloudCalibration
+
+    panel = _fleet_panel(_make_panel(tmp_path), 150.0)
+    with pytest.raises(RunnerError):
+        forecast_eval(
+            _cfg("cb"), panel_path=panel, spec=_spec(),
+            calibration=CloudCalibration(a=1.0, b=0.0, at_boundary=False, n_fit_hours=1),
+            calibration_cfg=CalibrationConfig(),
+        )
+
+
+def test_forecast_eval_bad_calibration_rejected(tmp_path: Path) -> None:
+    from src.oibc.config import CalibrationConfig
+    from src.oibc.models.calibrate import CloudCalibration
+
+    panel = _fleet_panel(_make_panel(tmp_path), 50.0)
+    with pytest.raises(RunnerError):
+        forecast_eval(
+            _cfg("cn"), panel_path=panel, spec=_spec(),
+            calibration=CloudCalibration(a=float("nan"), b=0.0, at_boundary=False, n_fit_hours=1),
+            calibration_cfg=CalibrationConfig(),
+        )
+
+
+def _hourly_pair(base_pen: list[float], cal_pen: list[float]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    ts = pd.DatetimeIndex(["2023-01-10 11:00", "2023-01-11 11:00"], tz=KST).as_unit("us")
+    opd = pd.DatetimeIndex(["2023-01-10", "2023-01-11"], tz=KST).as_unit("us")
+    kw = {"group": pd.Series(["G1", "G1"], dtype="string"),
+          "ts": pd.Series(ts, dtype=_DT), "op_date": pd.Series(opd, dtype=_DT)}
+    base = pd.DataFrame({**kw, "penalty": pd.Series(base_pen, dtype="float64")})
+    cal = pd.DataFrame({**kw, "penalty": pd.Series(cal_pen, dtype="float64")})
+    return base, cal
+
+
+def test_calibration_helper_guards(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.train import runner as cal_mod
+
+    base, cal = _hourly_pair([1.0, 3.0], [0.5, 1.5])
+    assert cal_mod._quarter_rel_calibration(base, cal) == {"2023Q1": pytest.approx(-0.5)}
+    shifted = cal.copy()
+    shifted["ts"] = shifted["ts"] + pd.Timedelta(hours=1)
+    with pytest.raises(RunnerError, match="alignment"):
+        cal_mod._quarter_rel_calibration(base, shifted)
+    _, inf_cal = _hourly_pair([1.0, 3.0], [float("inf"), 1.0])
+    with pytest.raises(RunnerError, match="quarter"):
+        cal_mod._quarter_rel_calibration(base, inf_cal)
+    assert cal_mod._rel_delta(0.0, 0.0) == 0.0
+    with pytest.raises(RunnerError, match="baseline"):
+        cal_mod._rel_delta(1.0, 0.0)
+    with pytest.raises(RunnerError, match="rel_delta"):
+        cal_mod._rel_delta(float("inf"), 1.0)
+    with pytest.raises(RunnerError):
+        cal_mod._pair_ci(np.array([1.0]), np.array([1.0, 2.0]), 1.0, 2.0, _vcfg())
+    monkeypatch.setattr(cal_mod, "block_bootstrap_ci", lambda *a, **k: (float("nan"), 0.0))
+    with pytest.raises(RunnerError, match="CI"):
+        cal_mod._pair_ci(np.array([1.0, 2.0]), np.array([1.0, 2.0]), 1.0, 2.0, _vcfg())
+
+
+def test_calibration_report_invalid_spec_rejected(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from src.oibc.evaluate.registry import ExperimentRecord, append_record
+    from src.oibc.train import runner as cal_mod
+
+    _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    rec = ExperimentRecord(
+        run_id="ghost", created_at=datetime(2026, 1, 1, tzinfo=UTC), hypothesis="h",
+        config={"competition": {"broken": True}}, git_commit=None, seeds=(0, 1),
+        folds=("A", "B"), metrics={}, comparison={},
+    )
+    append_record(rec, paths.registry)
+    with pytest.raises(RunnerError, match="competition spec"):
+        cal_mod.calibration_report("ghost", paths=paths, vcfg=_vcfg())
+
+
+def test_calibration_report_missing_provenance_rejected(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from src.oibc.evaluate.registry import ExperimentRecord, append_record
+    from src.oibc.train import runner as cal_mod
+
+    _make_panel(tmp_path)
+    paths = _paths(tmp_path)
+    rec = ExperimentRecord(
+        run_id="ghost", created_at=datetime(2026, 1, 1, tzinfo=UTC), hypothesis="h",
+        config={"competition": _spec().model_dump(mode="json")},
+        git_commit=None, seeds=(0, 1), folds=("A", "B"), metrics={}, comparison={},
+    )
+    append_record(rec, paths.registry)
+    with pytest.raises(RunnerError, match="provenance"):
+        cal_mod.calibration_report("ghost", paths=paths, vcfg=_vcfg())
+
+
+def test_calibration_report_single_fold_rejected(tmp_path: Path) -> None:
+    from src.oibc.train import runner as cal_mod
+
+    panel = _fleet_panel(_make_panel(tmp_path))
+    paths = _paths(tmp_path)
+    solo = ValidationConfig(
+        folds=_vcfg().folds[:1], embargo_days=1, min_warm_days=1, seeds=(0, 1), bootstrap_n=100
+    )
+    cal_mod.run_validation(_cfg("solo"), panel_path=panel, vcfg=solo, paths=paths, save_oof=True)
+    with pytest.raises(RunnerError, match=">= 2 folds"):
+        cal_mod.calibration_report("solo", paths=paths, vcfg=solo)
+
+
+def test_calibration_report_missing_panel_file(tmp_path: Path) -> None:
+    from src.oibc.train import runner as cal_mod
+
+    panel, paths, vcfg = _cal_artifacts(tmp_path, "calgone")
+    panel.unlink()
+    with pytest.raises(RunnerError, match="unreadable"):
+        cal_mod.calibration_report("calgone", paths=paths, vcfg=vcfg)
+
+
+def test_calibration_report_panel_read_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.train import runner as cal_mod
+
+    panel, paths, vcfg = _cal_artifacts(tmp_path, "calread")
+    real_read = pd.read_parquet
+    monkeypatch.setattr(
+        pd, "read_parquet",
+        lambda path, *a, **k: (_ for _ in ()).throw(OSError("disk gone"))
+        if str(path) == str(panel) else real_read(path, *a, **k),
+    )
+    with pytest.raises(RunnerError, match="unreadable"):
+        cal_mod.calibration_report("calread", paths=paths, vcfg=vcfg)
+
+
+def test_calibration_report_panel_contracts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.train import runner as cal_mod
+
+    panel, paths, vcfg = _cal_artifacts(tmp_path, "calpanel")
+    full = pd.read_parquet(panel)
+
+    def _frame(kind: str) -> pd.DataFrame:
+        if kind == "nocol":
+            return full.drop(columns=["wa_cloud_fleet"])
+        if kind == "empty":
+            out = full.copy()
+            out["period"] = "eval"
+            return out
+        out = full.copy()
+        out["wa_cloud_fleet"] = 150.0
+        return out
+
+    real_read = pd.read_parquet
+    state = {"kind": "nocol"}
+
+    def _selective(path: object, *a: object, **k: object) -> pd.DataFrame:
+        if str(path) == str(panel):
+            return _frame(state["kind"])
+        return real_read(path, *a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pd, "read_parquet", _selective)
+    with pytest.raises(RunnerError, match="columns"):
+        cal_mod.calibration_report("calpanel", paths=paths, vcfg=vcfg)
+    state["kind"] = "empty"
+    with pytest.raises(RunnerError, match="train period"):
+        cal_mod.calibration_report("calpanel", paths=paths, vcfg=vcfg)
+    state["kind"] = "range"
+    with pytest.raises(RunnerError, match="within"):
+        cal_mod.calibration_report("calpanel", paths=paths, vcfg=vcfg)
+
+
+def test_calibration_report_base_settle_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.evaluate.settlement import SettlementError
+    from src.oibc.train import runner as cal_mod
+
+    _, paths, vcfg = _cal_artifacts(tmp_path, "calbase")
+
+    def _boom(*a: object, **k: object) -> object:
+        raise SettlementError("boom")
+
+    monkeypatch.setattr(cal_mod, "aggregate_groups", _boom)
+    with pytest.raises(RunnerError, match="fold A"):
+        cal_mod.calibration_report("calbase", paths=paths, vcfg=vcfg)
+
+
+def test_calibration_report_fit_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.models.calibrate import CalibrationError
+    from src.oibc.train import runner as cal_mod
+
+    _, paths, vcfg = _cal_artifacts(tmp_path, "calfit")
+
+    def _boom(*a: object, **k: object) -> object:
+        raise CalibrationError("boom")
+
+    monkeypatch.setattr(cal_mod, "fit_cloud_calibration", _boom)
+    with pytest.raises(RunnerError, match="boom"):
+        cal_mod.calibration_report("calfit", paths=paths, vcfg=vcfg)
+
+
+def test_calibration_report_nonfinite_scales(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.train import runner as cal_mod
+
+    _, paths, vcfg = _cal_artifacts(tmp_path, "calscale")
+    monkeypatch.setattr(cal_mod, "scale_factors", lambda ts, index, cal: np.full(len(ts), np.inf))
+    with pytest.raises(RunnerError, match="scale"):
+        cal_mod.calibration_report("calscale", paths=paths, vcfg=vcfg)
+
+
+def test_calibration_report_apply_settle_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.evaluate.settlement import SettlementError
+    from src.oibc.train import runner as cal_mod
+
+    _, paths, vcfg = _cal_artifacts(tmp_path, "calapply")
+    real_settle = cal_mod.settle
+    calls = {"n": 0}
+
+    def _counting(frame: pd.DataFrame, smp: pd.DataFrame, **k: object) -> object:
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise SettlementError("boom")
+        return real_settle(frame, smp, **k)
+
+    monkeypatch.setattr(cal_mod, "settle", _counting)
+    with pytest.raises(RunnerError, match="fold A"):
+        cal_mod.calibration_report("calapply", paths=paths, vcfg=vcfg)
+
+
+def test_calibration_report_daily_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.train import runner as cal_mod
+
+    _, paths, vcfg = _cal_artifacts(tmp_path, "caldaily")
+    real_daily = cal_mod.daily_totals
+    calls = {"n": 0}
+
+    def _truncating(result: object, **k: object) -> pd.DataFrame:
+        calls["n"] += 1
+        out = real_daily(result, **k)  # type: ignore[arg-type]
+        return out.iloc[:1] if calls["n"] == 3 else out
+
+    monkeypatch.setattr(cal_mod, "daily_totals", _truncating)
+    with pytest.raises(RunnerError, match="daily length"):
+        cal_mod.calibration_report("caldaily", paths=paths, vcfg=vcfg)
+
+
+def test_calibration_report_production_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.evaluate.settlement import SettlementError
+    from src.oibc.models.calibrate import CalibrationError
+    from src.oibc.train import runner as cal_mod
+
+    def _run_with(patch: dict[str, object], run_id: str, match: str) -> None:
+        _, paths, vcfg = _cal_artifacts(tmp_path, run_id)
+        with monkeypatch.context() as sub:
+            for name, func in patch.items():
+                sub.setattr(cal_mod, name, func)
+            with pytest.raises(RunnerError, match=match):
+                cal_mod.calibration_report(run_id, paths=paths, vcfg=vcfg)
+
+    real_fit, real_scale, real_settle = cal_mod.fit_cloud_calibration, cal_mod.scale_factors, cal_mod.settle
+    for run_id, name, fail_at, match in [
+        ("calp1", "fit_cloud_calibration", 3, "boom-fit"),
+        ("calp2", "scale_factors", 3, "boom-scale"),
+        ("calp3", "settle", 5, "boom-settle"),
+    ]:
+        calls = {"n": 0}
+        if name == "fit_cloud_calibration":
+            def _fit(hourly, index, cfg, spec, _r=real_fit, _c=calls, _n=fail_at):
+                _c["n"] += 1
+                if _c["n"] == _n:
+                    raise CalibrationError("boom-fit")
+                return _r(hourly, index, cfg, spec)
+            _run_with({"fit_cloud_calibration": _fit}, run_id, match)
+        elif name == "scale_factors":
+            def _scale(ts, index, cal, _r=real_scale, _c=calls, _n=fail_at):
+                _c["n"] += 1
+                if _c["n"] == _n:
+                    raise CalibrationError("boom-scale")
+                return _r(ts, index, cal)
+            _run_with({"scale_factors": _scale}, run_id, match)
+        else:
+            def _settle(frame, smp, _r=real_settle, _c=calls, _n=fail_at, **k):
+                _c["n"] += 1
+                if _c["n"] == _n:
+                    raise SettlementError("boom-settle")
+                return _r(frame, smp, **k)
+            _run_with({"settle": _settle}, run_id, match)
+
+
+def test_calibration_report_serialization_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+
+    from src.oibc.train import runner as cal_mod
+
+    _, paths, vcfg = _cal_artifacts(tmp_path, "caljson")
+
+    def _boom(*a: object, **k: object) -> str:
+        raise ValueError("boom")
+
+    monkeypatch.setattr(cal_mod.json, "dumps", _boom)
+    with pytest.raises(RunnerError, match="serializable"):
+        cal_mod.calibration_report("caljson", paths=paths, vcfg=vcfg)
+    monkeypatch.setattr(cal_mod.json, "dumps", _json.dumps)

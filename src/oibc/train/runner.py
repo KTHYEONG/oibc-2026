@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import json
 import logging
 import re
 import subprocess
@@ -11,7 +12,7 @@ import time
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypedDict
 
 import numpy as np
 import pandas as pd
@@ -19,6 +20,7 @@ import pandas as pd
 from src.oibc.config import (
     REFERENCE_COMP_ID,
     ArtifactPaths,
+    CalibrationConfig,
     CompetitionSpec,
     DataPaths,
     RunConfig,
@@ -26,10 +28,18 @@ from src.oibc.config import (
 )
 from src.oibc.cv.splits import SplitError, assert_causal_split, fold_masks, site_history
 from src.oibc.data.schemas import _DT
-from src.oibc.evaluate.compare import DailyRuns, compare_runs, comparison_to_dict
+from src.oibc.evaluate.compare import CompareError, DailyRuns, block_bootstrap_ci, compare_runs, comparison_to_dict
 from src.oibc.evaluate.registry import ExperimentRecord, append_record, read_records
-from src.oibc.evaluate.settlement import aggregate_groups, daily_totals, settle
+from src.oibc.evaluate.settlement import SettlementError, aggregate_groups, daily_totals, settle
 from src.oibc.features.panel import feature_columns
+from src.oibc.models.calibrate import (
+    CalibrationError,
+    CloudCalibration,
+    apply_calibration,
+    cloud_index,
+    fit_cloud_calibration,
+    scale_factors,
+)
 from src.oibc.models.gbm import bag, fit_seed_models, predict_seed_kwh
 from src.oibc.models.regional import blend_seed_preds, fit_predict_regional
 from src.oibc.timeaxis import k_weight, op_date, require_hourly_kst
@@ -807,8 +817,12 @@ def forecast_eval(
     panel_path: Path | None = None,
     spec: CompetitionSpec | None = None,
     paths: ArtifactPaths | None = None,
+    calibration: CloudCalibration | None = None,
+    calibration_cfg: CalibrationConfig | None = None,
 ) -> pd.DataFrame:
     """학습 기간 전체로 학습한 seed-bag 모델의 평가 기간 (group, ts, forecast_kwh) 예측을 반환한다."""
+    if (calibration is None) != (calibration_cfg is None):
+        raise RunnerError("forecast: calibration and calibration_cfg must be paired")
     comp = spec if spec is not None else CompetitionSpec()
     panel_file = panel_path if panel_path is not None else _default_panel_path()
     panel = _load_panel(panel_file, cfg, comp)
@@ -816,6 +830,12 @@ def forecast_eval(
     features = feature_columns(panel, cfg.features)
     train_keep = list(dict.fromkeys([*features, "site_id", "ts", "energy", "capacity_kw", "smp", "k"]))
     eval_keep = list(dict.fromkeys([*features, "site_id", "ts", "capacity_kw"]))
+    if calibration is not None:
+        assert calibration_cfg is not None
+        eval_keep = list(dict.fromkeys([*eval_keep, *calibration_cfg.cloud_vars]))
+        missing = [c for c in eval_keep if c not in panel.columns]
+        if missing:
+            raise RunnerError(f"forecast: missing calibration columns {missing[:5]}")
     train = panel.loc[panel["period"] == "train", train_keep].reset_index(drop=True)
     eval_day = panel.loc[panel["period"] == "eval", eval_keep].reset_index(drop=True)
     assignment, _ = _resolve_assignment(panel, cfg.composition_id, comp, paths)
@@ -855,6 +875,19 @@ def forecast_eval(
     mean = bag(preds)
     if mean.shape != (len(eval_day),) or not np.isfinite(mean).all() or (mean < 0).any():
         raise RunnerError("forecast: invalid seed-bag predictions")
+    if calibration is not None:
+        assert calibration_cfg is not None
+        try:
+            index = cloud_index(eval_day, calibration_cfg)
+        except CalibrationError as exc:
+            raise RunnerError(f"forecast: {exc}") from exc
+        lookup = index.reindex(pd.DatetimeIndex(eval_day["ts"].unique()))
+        if bool(lookup.isna().any()):
+            raise RunnerError("forecast: missing cloud index")
+        try:
+            mean = apply_calibration(mean, eval_day["ts"], index, calibration)
+        except CalibrationError as exc:
+            raise RunnerError(f"forecast: {exc}") from exc
     del preds
     gc.collect()
     day = eval_day[["site_id", "ts"]].assign(forecast_kwh=mean)
@@ -1004,3 +1037,269 @@ def netting_report(
         "compositions": dict(hashes),
         "folds": fold_out,
     }
+
+
+class _CrossEntry(TypedDict):
+    """교차 적합 순서쌍 한 건의 계수·ΔW·CI 기록."""
+
+    fit: str
+    apply: str
+    causal: bool
+    a: float
+    b: float
+    at_boundary: bool
+    W_base: float
+    W_cal: float
+    rel_delta: float
+    ci_low: float
+    ci_high: float
+    quarter_rel: dict[str, float]
+
+
+def _quarter_rel_calibration(base_hourly: pd.DataFrame, cal_hourly: pd.DataFrame) -> dict[str, float]:
+    """운영일 분기(YYYYQn)별 상대 ΔW를 반환한다. 기준이 0인 분기는 제외한다."""
+    if not base_hourly["ts"].equals(cal_hourly["ts"]) or not base_hourly["group"].equals(cal_hourly["group"]):
+        raise RunnerError("calibration: hourly alignment mismatch")
+    opd = pd.DatetimeIndex(base_hourly["op_date"]).tz_convert("Asia/Seoul")
+    labels = np.array([f"{y}Q{q}" for y, q in zip(opd.year.tolist(), opd.quarter.tolist(), strict=True)])
+    base_pen = base_hourly["penalty"].to_numpy(dtype="float64")
+    cal_pen = cal_hourly["penalty"].to_numpy(dtype="float64")
+    out: dict[str, float] = {}
+    for label in sorted(set(labels.tolist())):
+        mask = labels == label
+        denom = float(base_pen[mask].sum())
+        if denom == 0.0:
+            continue
+        value = float(cal_pen[mask].sum()) / denom - 1.0
+        if not np.isfinite(value):
+            raise RunnerError("calibration: non-finite quarter delta")
+        out[label] = value
+    return out
+
+
+def _rel_delta(w_cal: float, w_base: float) -> float:
+    if w_base > 0.0:
+        value = w_cal / w_base - 1.0
+    elif w_cal == 0.0:
+        return 0.0
+    else:
+        raise RunnerError("calibration: non-positive baseline W")
+    if not np.isfinite(value):
+        raise RunnerError("calibration: non-finite rel_delta")
+    return float(value)
+
+
+def _pair_ci(
+    cal_daily: np.ndarray, base_daily: np.ndarray, w_cal: float, w_base: float, val: ValidationConfig,
+) -> tuple[float, float]:
+    if w_base == 0.0 and w_cal == 0.0:
+        return 0.0, 0.0
+    try:
+        low, high = block_bootstrap_ci(cal_daily, base_daily, val)
+    except CompareError as exc:
+        raise RunnerError(str(exc)) from exc
+    if not (np.isfinite(low) and np.isfinite(high)):
+        raise RunnerError("calibration: non-finite CI")
+    return float(low), float(high)
+
+
+def calibration_report(
+    run_id: str, *, cfg: CalibrationConfig | None = None, vcfg: ValidationConfig | None = None,
+    paths: ArtifactPaths | None = None, spec: CompetitionSpec | None = None,
+) -> dict[str, object]:
+    """run의 폴드 OOF로 운량 보정의 교차 적합 ΔW·CI·분기 부호와 pooled 계수를 계산해 반환한다. OOF·패널·구성 위반 시 RunnerError."""
+    from src.oibc.config import CompetitionSpec as RecordedCompetitionSpec
+
+    base = paths if paths is not None else ArtifactPaths()
+    cal_cfg = cfg if cfg is not None else CalibrationConfig()
+    val = vcfg if vcfg is not None else ValidationConfig()
+    _safe_component(run_id)
+    records = read_records(base.registry)
+    match = next((r for r in records if r.run_id == run_id), None)
+    _require(match is not None, f"registry: unknown run_id {run_id!r}")
+    assert match is not None
+    try:
+        spec_data = dict(match.config["competition"])
+        for key in ("train_end", "eval_start", "eval_end"):
+            spec_data[key] = pd.Timestamp(spec_data[key]).tz_convert("Asia/Seoul")
+        recorded = RecordedCompetitionSpec.model_validate(spec_data)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RunnerError("registry: invalid competition spec") from exc
+    comp = spec if spec is not None else recorded
+    _require(comp == recorded, "registry: competition spec mismatch")
+    folds = list(match.folds)
+    _require(bool(folds), "registry: empty folds")
+    if len(folds) < 2:
+        raise RunnerError("calibration: need >= 2 folds")
+    composition_id = match.config.get("composition_id") or REFERENCE_COMP_ID
+    sites = _read(DataPaths().canonical_dir / "sites.parquet", ["site_id", "current_group", "capacity_kw"])
+    assignment, comp_sha = resolve_composition(composition_id, sites, paths=base, spec=comp)
+    recorded_sha = match.config.get("composition_sha256")
+    if isinstance(recorded_sha, str) and recorded_sha:
+        _require(recorded_sha == comp_sha, "calibration: composition hash mismatch")
+    panel_path_raw = match.config.get("panel_path")
+    panel_sha = match.config.get("panel_sha256")
+    if not isinstance(panel_path_raw, str) or not panel_path_raw or not isinstance(panel_sha, str) or not panel_sha:
+        raise RunnerError("registry: missing panel provenance")
+    panel_file = Path(panel_path_raw)
+    try:
+        current_hash = _sha256(panel_file)
+    except OSError as exc:
+        raise RunnerError(f"panel: unreadable ({exc})") from exc
+    _require(current_hash == panel_sha, "calibration: panel hash mismatch")
+    try:
+        panel = pd.read_parquet(panel_file, columns=["ts", "period", *cal_cfg.cloud_vars])
+    except (OSError, ValueError) as exc:
+        raise RunnerError(f"panel: unreadable ({exc})") from exc
+    if panel.columns.has_duplicates or not {"ts", "period", *cal_cfg.cloud_vars} <= set(panel.columns):
+        raise RunnerError("panel: missing or duplicate columns")
+    train_panel = panel.loc[panel["period"].eq("train")].reset_index(drop=True)
+    if train_panel.empty:
+        raise RunnerError("panel: empty train period")
+    try:
+        index = cloud_index(train_panel, cal_cfg)
+    except CalibrationError as exc:
+        raise RunnerError(str(exc)) from exc
+    smp = _resolve_smp(pd.DataFrame(), comp)
+    grouped: dict[str, pd.DataFrame] = {}
+    hourly: dict[str, pd.DataFrame] = {}
+    base_w: dict[str, float] = {}
+    base_daily: dict[str, np.ndarray] = {}
+    base_hourly_full: dict[str, pd.DataFrame] = {}
+    for fold in folds:
+        _safe_component(fold)
+        oof = load_oof(run_id, fold, paths=base)
+        _require(not oof.empty and bool((oof["ts"] <= comp.train_end).all()), "oof: empty or evaluation labels forbidden")
+        frame = pd.DataFrame(
+            {
+                "site_id": oof["site_id"].astype("string").reset_index(drop=True),
+                "ts": pd.Series(pd.DatetimeIndex(oof["ts"]), dtype=_DT),
+                "pred_kwh": oof["pred_bag"].to_numpy(dtype="float64"),
+                "actual_kwh": oof["actual_kwh"].to_numpy(dtype="float64"),
+            }
+        )
+        try:
+            groups = aggregate_groups(frame, assignment, spec=comp)
+            base_res = settle(groups, smp, spec=comp)
+        except SettlementError as exc:
+            raise RunnerError(f"fold {fold}: {exc}") from exc
+        grouped[fold] = groups
+        hourly[fold] = base_res.hourly[["ts", "forecast_kwh", "actual_kwh", "smp", "k"]].copy()
+        base_hourly_full[fold] = base_res.hourly
+        base_w[fold] = float(base_res.penalty)
+        daily = daily_totals(base_res)
+        base_daily[fold] = daily["penalty"].to_numpy(dtype="float64")
+    order = {name: pos for pos, name in enumerate(folds)}
+    cross: list[_CrossEntry] = []
+    pair_cal_daily: dict[tuple[str, str], np.ndarray] = {}
+    pair_base_daily: dict[tuple[str, str], np.ndarray] = {}
+    for apply in folds:
+        for fit in folds:
+            if fit == apply:
+                continue
+            try:
+                cal = fit_cloud_calibration(hourly[fit], index, cal_cfg, comp)
+                factors = scale_factors(grouped[apply]["ts"], index, cal)
+            except CalibrationError as exc:
+                raise RunnerError(str(exc)) from exc
+            if not np.all(np.isfinite(factors)) or bool((factors < 0).any()):
+                raise RunnerError("calibration: non-finite scale factors")
+            cal_groups = grouped[apply].copy()
+            cal_groups["forecast_kwh"] = (
+                grouped[apply]["forecast_kwh"].to_numpy(dtype="float64") * factors
+            )
+            try:
+                cal_res = settle(cal_groups, smp, spec=comp)
+            except SettlementError as exc:
+                raise RunnerError(f"fold {apply}: {exc}") from exc
+            cal_daily = daily_totals(cal_res)["penalty"].to_numpy(dtype="float64")
+            if cal_daily.shape != base_daily[apply].shape:
+                raise RunnerError(f"fold {apply}: daily length mismatch")
+            w_base = base_w[apply]
+            w_cal = float(cal_res.penalty)
+            rel = _rel_delta(w_cal, w_base)
+            low, high = _pair_ci(cal_daily, base_daily[apply], w_cal, w_base, val)
+            quarters = _quarter_rel_calibration(base_hourly_full[apply], cal_res.hourly)
+            cross.append(
+                {
+                    "fit": fit,
+                    "apply": apply,
+                    "causal": bool(order[fit] < order[apply]),
+                    "a": float(cal.a),
+                    "b": float(cal.b),
+                    "at_boundary": bool(cal.at_boundary),
+                    "W_base": float(w_base),
+                    "W_cal": float(w_cal),
+                    "rel_delta": float(rel),
+                    "ci_low": float(low),
+                    "ci_high": float(high),
+                    "quarter_rel": {k: float(v) for k, v in quarters.items()},
+                }
+            )
+            pair_cal_daily[(fit, apply)] = cal_daily
+            pair_base_daily[(fit, apply)] = base_daily[apply]
+            logger.info(
+                "[EVAL] calibration run=%s fit=%s apply=%s a=%r b=%r rel_delta=%r",
+                run_id, fit, apply, float(cal.a), float(cal.b), float(rel),
+            )
+    pooled_w_cal = float(sum(e["W_cal"] for e in cross))
+    pooled_w_base = float(sum(e["W_base"] for e in cross))
+    pooled_rel = _rel_delta(pooled_w_cal, pooled_w_base)
+    pair_order = sorted(cross, key=lambda e: (order[e["apply"]], order[e["fit"]]))
+    pooled_cal_daily = np.concatenate([pair_cal_daily[(e["fit"], e["apply"])] for e in pair_order])
+    pooled_base_daily = np.concatenate([pair_base_daily[(e["fit"], e["apply"])] for e in pair_order])
+    pooled_low, pooled_high = _pair_ci(pooled_cal_daily, pooled_base_daily, pooled_w_cal, pooled_w_base, val)
+    all_hourly = pd.concat([hourly[fold] for fold in folds], ignore_index=True)
+    try:
+        production = fit_cloud_calibration(all_hourly, index, cal_cfg, comp)
+    except CalibrationError as exc:
+        raise RunnerError(str(exc)) from exc
+    all_groups = pd.concat([grouped[fold] for fold in folds], ignore_index=True)
+    try:
+        prod_factors = scale_factors(all_groups["ts"], index, production)
+    except CalibrationError as exc:
+        raise RunnerError(str(exc)) from exc
+    prod_groups = all_groups.copy()
+    prod_groups["forecast_kwh"] = all_groups["forecast_kwh"].to_numpy(dtype="float64") * prod_factors
+    try:
+        prod_res = settle(prod_groups, smp, spec=comp)
+    except SettlementError as exc:
+        raise RunnerError(f"production: {exc}") from exc
+    in_sample = _rel_delta(float(prod_res.penalty), float(sum(base_w.values())))
+    reasons: list[str] = [
+        f"pair_not_improved={e['fit']}->{e['apply']}:rel_delta={e['rel_delta']:.4g}>=0"
+        for e in cross
+        if not e["rel_delta"] < 0.0
+    ]
+    if not pooled_rel <= -val.min_rel_improvement:
+        reasons.append(f"pooled={pooled_rel:.4g}<min={val.min_rel_improvement:g}")
+    if not pooled_high < 0.0:
+        reasons.append(f"pooled_ci_high={pooled_high:.4g}>=0")
+    reasons.extend(f"at_boundary={e['fit']}->{e['apply']}" for e in cross if e["at_boundary"])
+    if production.at_boundary:
+        reasons.append("at_boundary=production")
+    decision = "adopt" if not reasons else "reject"
+    payload: dict[str, object] = {
+        "run_id": run_id,
+        "panel_sha256": panel_sha,
+        "composition_id": composition_id,
+        "composition_sha256": comp_sha,
+        "config": cal_cfg.model_dump(mode="json"),
+        "cross_fit": cross,
+        "pooled": {"rel_delta": float(pooled_rel), "ci_low": float(pooled_low), "ci_high": float(pooled_high)},
+        "production": {
+            "a": float(production.a),
+            "b": float(production.b),
+            "at_boundary": bool(production.at_boundary),
+            "n_fit_hours": int(production.n_fit_hours),
+            "rel_delta_in_sample": float(in_sample),
+        },
+        "decision": decision,
+        "reasons": list(reasons),
+    }
+    try:
+        json.dumps(payload, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise RunnerError(f"calibration: non-serializable report ({exc})") from exc
+    logger.info("[EVAL] calibration run=%s decision=%s pooled_rel=%r", run_id, decision, float(pooled_rel))
+    return payload

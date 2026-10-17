@@ -59,6 +59,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub_cmd = sub.add_parser("submit")
     sub_cmd.add_argument("--run-id", required=True)
     sub_cmd.add_argument("--sub-id", required=True)
+    sub_cmd.add_argument("--calibration", action="store_true")
+    rc = sub.add_parser("report-calibration")
+    rc.add_argument("--run-id", required=True)
     args = parser.parse_args(list(argv) if argv is not None else None)
     start = time.perf_counter()
     logger.info("[SYS] pipeline %s start", args.command)
@@ -151,7 +154,51 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise RunnerError("submit: composition hash drift")
         elif cfg.composition_id != REFERENCE_COMP_ID:
             raise RunnerError("submit: missing composition_sha256")
-        forecast = forecast_eval(cfg, panel_path=panel_path, spec=spec)
+        cal = None
+        cal_cfg = None
+        cal_record = None
+        note = ""
+        if args.calibration:
+            import json as _json
+
+            from src.oibc.config import ArtifactPaths as _ArtifactPaths
+            from src.oibc.config import CalibrationConfig as _CalibrationConfig
+            from src.oibc.models.calibrate import CloudCalibration as _CloudCalibration
+
+            cal_path = _ArtifactPaths().runs / args.run_id / "calibration.json"
+            try:
+                cal_report = _json.loads(cal_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise RunnerError(f"submit: unreadable calibration report ({exc})") from exc
+            if not isinstance(cal_report, dict):
+                raise RunnerError("submit: invalid calibration report")
+            if cal_report.get("run_id") != args.run_id:
+                raise RunnerError("submit: calibration run_id mismatch")
+            if cal_report.get("panel_sha256") != panel_hash:
+                raise RunnerError("submit: calibration panel hash mismatch")
+            if cal_report.get("decision") != "adopt":
+                raise RunnerError("submit: calibration not adopted")
+            prod = cal_report.get("production")
+            if not isinstance(prod, dict):
+                raise RunnerError("submit: invalid calibration production")
+            try:
+                cal_a = float(prod["a"])
+                cal_b = float(prod["b"])
+                cal_n = int(prod["n_fit_hours"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RunnerError(f"submit: invalid calibration production ({exc})") from exc
+            if not (math.isfinite(cal_a) and math.isfinite(cal_b)):
+                raise RunnerError("submit: non-finite calibration")
+            if prod.get("at_boundary"):
+                raise RunnerError("submit: calibration at boundary")
+            try:
+                cal_cfg = _CalibrationConfig.model_validate(cal_report["config"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RunnerError(f"submit: invalid calibration config ({exc})") from exc
+            cal = _CloudCalibration(a=cal_a, b=cal_b, at_boundary=False, n_fit_hours=cal_n)
+            cal_record = {"a": cal_a, "b": cal_b}
+            note = "calibration: production a,b from calibration.json"
+        forecast = forecast_eval(cfg, panel_path=panel_path, spec=spec, calibration=cal, calibration_cfg=cal_cfg)
         _, final_sha = resolve_composition(
             cfg.composition_id, pd.read_parquet(DataPaths().canonical_dir / "sites.parquet"), spec=spec,
         )
@@ -164,6 +211,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_id=args.run_id,
             composition_id=cfg.composition_id,
             local_metrics=local_metrics,
+            note=note,
+            calibration=cal_record,
             spec=spec,
         )
     elif args.command == "report-netting":
@@ -188,6 +237,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             fh.write(payload)
             fh.write("\n")
         logger.info("[VPP] netting report run=%s path=%s", args.run_id, out_path)
+    elif args.command == "report-calibration":
+        import json
+
+        from src.oibc.config import ArtifactPaths as _ArtifactPaths
+        from src.oibc.train.runner import calibration_report
+
+        cal_report = calibration_report(args.run_id)
+        run_dir = _ArtifactPaths().runs / args.run_id
+        out_path = run_dir / "calibration.json"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(cal_report, ensure_ascii=False, indent=2, allow_nan=False)
+        with out_path.open("x", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.write("\n")
+        logger.info(
+            "[EVAL] calibration report run=%s decision=%s path=%s",
+            args.run_id, cal_report.get("decision"), out_path,
+        )
     elapsed = time.perf_counter() - start
     logger.info("[SYS] pipeline %s done in %.1fs", args.command, elapsed)
     return exit_code

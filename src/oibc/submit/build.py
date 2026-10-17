@@ -47,6 +47,7 @@ class SubmissionManifest(BaseModel):
     warnings: tuple[str, ...]
     leaderboard_score: float | None = None
     note: str = ""
+    calibration: dict[str, float] | None = None
 
     @field_validator("sub_id")
     @classmethod
@@ -68,6 +69,16 @@ class SubmissionManifest(BaseModel):
         for key, val in v.items():
             if not math.isfinite(val):
                 raise ValueError(f"non-finite metric: {key}")
+        return v
+
+    @field_validator("calibration")
+    @classmethod
+    def _check_calibration(cls, v: dict[str, float] | None) -> dict[str, float] | None:
+        if v is None:
+            return v
+        for key, val in v.items():
+            if not math.isfinite(val):
+                raise ValueError(f"non-finite calibration: {key}")
         return v
 
 
@@ -140,6 +151,7 @@ def write_submission(
     composition_id: str | None = None,
     local_metrics: Mapping[str, float] | None = None,
     note: str = "",
+    calibration: Mapping[str, float] | None = None,
     out_root: Path | None = None,
     ref: SubmissionReference | None = None,
     spec: CompetitionSpec | None = None,
@@ -148,6 +160,14 @@ def write_submission(
     cfg = spec if spec is not None else CompetitionSpec()
     if not sub_id or _SUB_ID_RE.fullmatch(sub_id) is None:
         raise SubmissionError(f"invalid sub_id: {sub_id!r}")
+    cal_record: dict[str, float] | None = None
+    if calibration is not None:
+        try:
+            cal_record = {str(k): float(v) for k, v in dict(calibration).items()}
+        except (TypeError, ValueError) as e:
+            raise SubmissionError(f"calibration: bad value ({e})") from e
+        if any(not math.isfinite(v) for v in cal_record.values()):
+            raise SubmissionError("calibration: non-finite value")
     _check_assignment_keys(assignment)
     _check_forecast_keys(forecast)
     reference = ref if ref is not None else load_reference(spec=cfg)
@@ -216,6 +236,7 @@ def write_submission(
             warnings=tuple(report.warnings),
             leaderboard_score=None,
             note=note,
+            calibration=cal_record,
         )
         (tmp / "manifest.json").write_text(
             manifest.model_dump_json(indent=2, ensure_ascii=False), encoding="utf-8"

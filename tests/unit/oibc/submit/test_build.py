@@ -371,3 +371,67 @@ def test_target_created_during_write_not_clobbered(
         write_submission(_assignment(), _forecast(), "s21", out_root=out, ref=ref, spec=spec)
     assert list((out / "s21").iterdir()) == []
     assert not (out / ".s21.tmp").exists()
+
+
+def test_manifest_records_calibration(ctx: tuple[vmod.SubmissionReference, CompetitionSpec, Path]) -> None:
+    import json
+
+    ref, spec, out = ctx
+    target = write_submission(
+        _assignment(), _forecast(), "scal", out_root=out, ref=ref, spec=spec,
+        calibration={"a": 0.975, "b": 0.04},
+    )
+    raw = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
+    assert raw["calibration"] == {"a": 0.975, "b": 0.04}
+
+
+def test_manifest_calibration_rejects_nonfinite(ctx: tuple[vmod.SubmissionReference, CompetitionSpec, Path]) -> None:
+    ref, spec, out = ctx
+    with pytest.raises((SubmissionError, ValidationError)):
+        write_submission(
+            _assignment(), _forecast(), "sbad", out_root=out, ref=ref, spec=spec,
+            calibration={"a": float("nan")},
+        )
+    assert not (out / "sbad").exists()
+    assert not (out / ".sbad.tmp").exists()
+
+
+def test_manifest_legacy_without_calibration(ctx: tuple[vmod.SubmissionReference, CompetitionSpec, Path]) -> None:
+    import json
+
+    ref, spec, out = ctx
+    target = write_submission(_assignment(), _forecast(), "sleg", out_root=out, ref=ref, spec=spec)
+    manifest_path = target / "manifest.json"
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw.pop("calibration", None)
+    manifest_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    updated = record_leaderboard_score(target, 1.0)
+    assert updated.calibration is None
+
+
+def test_manifest_calibration_validator() -> None:
+    with pytest.raises(ValidationError, match="non-finite calibration"):
+        SubmissionManifest(
+            sub_id="s",
+            created_at=pd.Timestamp("2025-06-01", tz="Asia/Seoul").to_pydatetime(),
+            run_id=None,
+            composition_id=None,
+            git_commit=None,
+            composition_sha256="a",
+            forecast_sha256="b",
+            group_capacity_kw={},
+            group_forecast_total_kwh={},
+            local_metrics={},
+            warnings=(),
+            calibration={"a": float("inf")},
+        )
+
+
+def test_write_submission_calibration_bad_value(ctx: tuple[vmod.SubmissionReference, CompetitionSpec, Path]) -> None:
+    ref, spec, out = ctx
+    with pytest.raises(SubmissionError, match="calibration"):
+        write_submission(
+            _assignment(), _forecast(), "scv", out_root=out, ref=ref, spec=spec,
+            calibration={"a": "abc"},
+        )
+    assert not (out / "scv").exists()

@@ -554,3 +554,176 @@ def test_validate_run_regional_weight_invalid(monkeypatch: pytest.MonkeyPatch) -
     with pytest.raises(ValueError, match="weight"):
         main(["validate-run", "--run-id", "r1", "--hypothesis", "h", "--regional-weight", "1.5"])
     assert calls == []
+
+
+def _cal_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import src.oibc.config as config_mod
+
+    paths = config_mod.ArtifactPaths(
+        root=tmp_path,
+        registry=tmp_path / "registry.jsonl",
+        submissions=tmp_path / "subs",
+        runs=tmp_path / "runs",
+        compositions=tmp_path / "comps",
+    )
+    monkeypatch.setattr(config_mod, "ArtifactPaths", lambda *a, **k: paths)
+    return paths
+
+
+def test_report_calibration_writes_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.pipeline as pipeline_mod
+    from src.oibc.train import runner as runner_mod
+
+    report = {"run_id": "r1", "decision": "adopt", "config": {}, "production": {}}
+    monkeypatch.setattr(runner_mod, "calibration_report", lambda *a, **k: report)
+    paths = _cal_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(pipeline_mod, "ArtifactPaths", lambda *a, **k: paths, raising=False)
+    assert main(["report-calibration", "--run-id", "r1"]) == 0
+    out = paths.runs / "r1" / "calibration.json"
+    assert out.exists()
+    import json
+
+    assert json.loads(out.read_text(encoding="utf-8"))["decision"] == "adopt"
+    before = out.read_bytes()
+    with pytest.raises(FileExistsError):
+        main(["report-calibration", "--run-id", "r1"])
+    assert out.read_bytes() == before
+
+
+def _submit_cal_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: str):
+    import hashlib
+    import json
+    from datetime import UTC, datetime
+
+    import src.oibc.pipeline as pipeline_mod
+    from src.oibc.evaluate import registry as registry_mod
+    from src.oibc.evaluate.registry import ExperimentRecord
+    from src.oibc.config import FeatureConfig, ModelConfig, RunConfig
+
+    paths = _cal_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(pipeline_mod, "ArtifactPaths", lambda *a, **k: paths, raising=False)
+    panel_path = tmp_path / "panel.parquet"
+    panel_path.write_bytes(b"validated panel")
+    panel_hash = hashlib.sha256(panel_path.read_bytes()).hexdigest()
+    cfg = RunConfig(run_id="r1", hypothesis="h", features=FeatureConfig(groups=frozenset()), model=ModelConfig(seeds=(0,), weight="none"))
+    config = cfg.model_dump(mode="json") | {
+        "panel_path": str(panel_path), "panel_sha256": panel_hash,
+        "composition_sha256": "abc",
+        "competition": CompetitionSpec().model_dump(mode="json"),
+    }
+    rec = ExperimentRecord(
+        run_id="r1",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        hypothesis="h",
+        config=config,
+        git_commit=None,
+        seeds=(0,),
+        folds=("A",),
+        metrics={"A/0": {"W": 1.0}},
+        comparison={"bag": {"A": {"W_all": 5.0, "W_warm": 2.0}}},
+    )
+    monkeypatch.setattr(registry_mod, "read_records", lambda *a, **k: [rec])
+    monkeypatch.setattr(pd, "read_parquet", lambda *a, **k: pd.DataFrame({"site_id": ["s"], "current_group": ["A"]}))
+    monkeypatch.setattr(
+        runner_mod, "resolve_composition",
+        lambda *a, **k: (pd.DataFrame({"site_id": ["s"], "group": ["G1"]}), "abc"),
+    )
+    run_dir = paths.runs / "r1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_id": "r1",
+        "panel_sha256": panel_hash,
+        "decision": decision,
+        "reasons": [],
+        "config": {"cloud_vars": ["wa_cloud_fleet", "wb_cloud_fleet"], "a_min": 0.90, "a_max": 1.05,
+                   "b_min": -0.05, "b_max": 0.15, "step": 0.0025},
+        "production": {"a": 0.975, "b": 0.04, "at_boundary": False, "n_fit_hours": 10,
+                       "rel_delta_in_sample": -0.02},
+    }
+    (run_dir / "calibration.json").write_text(json.dumps(payload), encoding="utf-8")
+    return panel_path, run_dir
+
+
+def test_submit_calibration_requires_adopt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _submit_cal_env(tmp_path, monkeypatch, "reject")
+
+    def no_forecast(*args, **kwargs):
+        pytest.fail("reject 보고서로 예측 실행")
+
+    monkeypatch.setattr(runner_mod, "forecast_eval", no_forecast)
+    with pytest.raises(runner_mod.RunnerError):
+        main(["submit", "--run-id", "r1", "--sub-id", "s1", "--calibration"])
+
+
+def test_submit_calibration_passes_production_params(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.submit import build as build_mod
+
+    _submit_cal_env(tmp_path, monkeypatch, "adopt")
+    seen: dict[str, object] = {}
+
+    def predict(cfg, **kwargs):
+        seen.update(kwargs)
+        return pd.DataFrame({"group": ["G1"], "ts": [pd.Timestamp("2025-06-01 01:00", tz="Asia/Seoul")], "forecast_kwh": [1.0]})
+
+    monkeypatch.setattr(runner_mod, "forecast_eval", predict)
+    writes: list[tuple[object, ...]] = []
+    monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: writes.append((a, k)))
+    assert main(["submit", "--run-id", "r1", "--sub-id", "s1", "--calibration"]) == 0
+    cal = seen["calibration"]
+    assert (cal.a, cal.b) == (0.975, 0.04)
+    assert writes[0][1]["calibration"] == {"a": 0.975, "b": 0.04}
+    assert writes[0][1]["note"] == "calibration: production a,b from calibration.json"
+
+
+def test_submit_without_flag_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.submit import build as build_mod
+
+    _submit_cal_env(tmp_path, monkeypatch, "adopt")
+    seen: dict[str, object] = {}
+
+    def predict(cfg, **kwargs):
+        seen.update(kwargs)
+        return pd.DataFrame({"group": ["G1"], "ts": [pd.Timestamp("2025-06-01 01:00", tz="Asia/Seoul")], "forecast_kwh": [1.0]})
+
+    monkeypatch.setattr(runner_mod, "forecast_eval", predict)
+    monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: None)
+    assert main(["submit", "--run-id", "r1", "--sub-id", "s1"]) == 0
+    assert seen.get("calibration") is None
+
+
+@pytest.mark.parametrize(
+    "defect", ["missing", "nondict", "run", "panel", "prodtype", "prodkeys", "nonfinite", "boundary", "config"]
+)
+def test_submit_calibration_guard_rejects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str) -> None:
+    import json
+
+    _, run_dir = _submit_cal_env(tmp_path, monkeypatch, "adopt")
+    cal_path = run_dir / "calibration.json"
+    payload = json.loads(cal_path.read_text(encoding="utf-8"))
+    if defect == "missing":
+        cal_path.unlink()
+    else:
+        if defect == "nondict":
+            payload = [1, 2]
+        elif defect == "run":
+            payload["run_id"] = "other"
+        elif defect == "panel":
+            payload["panel_sha256"] = "dead"
+        elif defect == "prodtype":
+            payload["production"] = [1]
+        elif defect == "prodkeys":
+            payload["production"] = {"a": 1.0}
+        elif defect == "nonfinite":
+            payload["production"]["a"] = float("inf")
+        elif defect == "boundary":
+            payload["production"]["at_boundary"] = True
+        else:
+            payload["config"] = {"cloud_vars": []}
+        cal_path.write_text(json.dumps(payload, allow_nan=True), encoding="utf-8")
+
+    def no_forecast(*args, **kwargs):
+        pytest.fail("가드 위반 보고서로 예측 실행")
+
+    monkeypatch.setattr(runner_mod, "forecast_eval", no_forecast)
+    with pytest.raises(runner_mod.RunnerError):
+        main(["submit", "--run-id", "r1", "--sub-id", "s1", "--calibration"])

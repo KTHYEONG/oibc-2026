@@ -532,8 +532,13 @@ def run_validation(
             raise RunnerError(f"registry: unknown baseline {cfg.baseline_run_id!r}")
         config_diff = _check_comparable(matches[0], cfg, panel_hash, val, comp)
     panel = _load_panel(panel_file, cfg, comp)
-    train_panel = panel[panel["period"] == "train"].reset_index(drop=True)
+    features = feature_columns(panel, cfg.features)
+    keep = list(dict.fromkeys(["site_id", "ts", "op_date", "energy", "capacity_kw", "smp", "k", *features]))
+    train_panel = panel.loc[panel["period"] == "train", keep].reset_index(drop=True)
     assignment, comp_sha = _resolve_assignment(panel, cfg.composition_id, comp, base)
+    # _night_frame이 generation·solar 전체를 읽으므로 그 전에 panel을 해제해 peak RSS를 낮춘다.
+    del panel
+    gc.collect()
     sites = _read(DataPaths().canonical_dir / "sites.parquet", ["site_id", "capacity_kw"])
     site_cap = sites.set_index("site_id")["capacity_kw"]
     caps = {
@@ -544,15 +549,10 @@ def run_validation(
         "[VPP] run=%s composition_id=%s sha256=%s caps=%s",
         cfg.run_id, cfg.composition_id, comp_sha, caps,
     )
-    smp_full = _resolve_smp(panel, comp)
+    smp_full = _resolve_smp(train_panel, comp)
     night_all = _night_frame(train_panel["ts"], cfg.features.day_min_elev_deg, spec=comp, day_rows=train_panel)
     if not night_all["site_id"].isin(assignment["site_id"]).all():
         raise RunnerError("generation: unknown site")
-    features = feature_columns(panel, cfg.features)
-    keep = list(dict.fromkeys(["site_id", "ts", "op_date", "energy", "capacity_kw", "smp", "k", *features]))
-    train_panel = train_panel.loc[:, keep].copy()
-    del panel
-    gc.collect()
     metrics: dict[str, dict[str, float]] = {}
     bag_w: dict[str, dict[str, float]] = {}
     history_rows = pd.concat([train_panel[["site_id", "op_date"]], night_all[["site_id", "op_date"]]], ignore_index=True)
@@ -762,15 +762,13 @@ def forecast_eval(
     comp = spec if spec is not None else CompetitionSpec()
     panel_file = panel_path if panel_path is not None else _default_panel_path()
     panel = _load_panel(panel_file, cfg, comp)
-    train = panel[panel["period"] == "train"].reset_index(drop=True)
-    eval_day = panel[panel["period"] == "eval"].reset_index(drop=True)
     features = feature_columns(panel, cfg.features)
-    assignment, _ = _resolve_assignment(panel, cfg.composition_id, comp, paths)
-    smp = _resolve_smp(panel, comp)
     train_keep = list(dict.fromkeys([*features, "energy", "capacity_kw", "smp", "k"]))
     eval_keep = list(dict.fromkeys([*features, "site_id", "ts", "capacity_kw"]))
-    train = train.loc[:, train_keep].copy()
-    eval_day = eval_day.loc[:, eval_keep].copy()
+    train = panel.loc[panel["period"] == "train", train_keep].reset_index(drop=True)
+    eval_day = panel.loc[panel["period"] == "eval", eval_keep].reset_index(drop=True)
+    assignment, _ = _resolve_assignment(panel, cfg.composition_id, comp, paths)
+    smp = _resolve_smp(panel, comp)
     del panel
     gc.collect()
     eval_ts = pd.DatetimeIndex(smp.loc[smp["period"] == "eval", "ts"]).sort_values()
@@ -785,11 +783,15 @@ def forecast_eval(
     solar = _read(DataPaths().derived_dir / "solar.parquet", ["site_id", "ts", "elev"])
     _check_keys(solar)
     grid = grid.merge(solar, on=["site_id", "ts"], how="left", validate="one_to_one")
+    del solar
     if not np.isfinite(grid["elev"].to_numpy(dtype="float64")).all():
         raise RunnerError("grid: missing solar")
     expected_day = _key_index(grid.loc[grid["elev"] > cfg.features.day_min_elev_deg])
     if not _key_index(eval_day).sort_values().equals(expected_day.sort_values()):
         raise RunnerError("panel: missing or unexpected evaluation daylight rows")
+    grid = grid[["site_id", "ts"]]
+    del expected_day
+    gc.collect()
     models = fit_seed_models(train, features, cfg.model)
     preds = predict_seed_kwh(models, eval_day, features, num_threads=cfg.model.n_jobs)
     mean = bag(preds)

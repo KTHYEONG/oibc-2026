@@ -47,12 +47,12 @@ def _features(panel: pd.DataFrame, features: Sequence[str]) -> np.ndarray:
     if not features or len(set(features)) != len(features):
         raise ModelError("features must be non-empty and distinct")
     _require_columns(panel, features)
+    # 열 단위로 C-order 버퍼에 채운다: DataFrame 전체 변환은 F-order 사본 + C-order 사본이 동시에 생겨 peak가 2배가 된다.
+    data = np.empty((len(panel), len(features)), dtype=np.float32)
     try:
         with np.errstate(over="ignore", invalid="ignore"):
-            data = panel.loc[:, list(features)].to_numpy(dtype="float32", copy=False)
-        data = np.asarray(data, dtype=np.float32)
-        if not data.flags["C_CONTIGUOUS"]:
-            data = np.ascontiguousarray(data, dtype=np.float32)
+            for j, col in enumerate(features):
+                data[:, j] = panel[col].to_numpy(dtype="float32")
     except (ValueError, TypeError) as exc:
         raise ModelError("columns must be numeric") from exc
     if np.isinf(data).any():

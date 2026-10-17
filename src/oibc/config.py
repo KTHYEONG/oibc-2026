@@ -168,6 +168,51 @@ class FeatureConfig(BaseModel):
         return self
 
 
+class CalibrationConfig(BaseModel):
+    """운량 선형 사후 보정 격자·입력 변수 설정."""
+
+    model_config = ConfigDict(frozen=True)
+
+    cloud_vars: tuple[str, ...] = ("wa_cloud_fleet", "wb_cloud_fleet")
+    a_min: float = 0.90
+    a_max: float = 1.05
+    b_min: float = -0.05
+    b_max: float = 0.15
+    step: float = 0.0025
+
+    @model_validator(mode="after")
+    def _check_calibration(self) -> CalibrationConfig:
+        if len(self.cloud_vars) == 0 or len(set(self.cloud_vars)) != len(self.cloud_vars):
+            raise ValueError("cloud_vars must be non-empty and distinct")
+        for name in self.cloud_vars:
+            if not name.endswith("_fleet"):
+                raise ValueError(f"cloud_vars: {name!r} must end with _fleet")
+        for name in ("a_min", "a_max", "b_min", "b_max", "step"):
+            if not isfinite(getattr(self, name)):
+                raise ValueError(f"{name} must be finite")
+        if not self.a_min < self.a_max:
+            raise ValueError("a_min must be < a_max")
+        if not self.b_min < self.b_max:
+            raise ValueError("b_min must be < b_max")
+        if not self.step > 0:
+            raise ValueError("step must be > 0")
+        if not self.a_min <= 1.0 <= self.a_max:
+            raise ValueError("grid must contain identity a=1.0")
+        if not self.b_min <= 0.0 <= self.b_max:
+            raise ValueError("grid must contain identity b=0.0")
+        qa = (self.a_max - self.a_min) / self.step
+        qb = (self.b_max - self.b_min) / self.step
+        ia = (1.0 - self.a_min) / self.step
+        ib = (0.0 - self.b_min) / self.step
+        if any(abs(q - round(q)) > 1e-9 for q in (qa, qb, ia, ib)):
+            raise ValueError("grid endpoints and identity (1, 0) must align with step")
+        n_a = round(qa) + 1
+        n_b = round(qb) + 1
+        if n_a * n_b > 100_000:
+            raise ValueError("grid size must not exceed 100_000")
+        return self
+
+
 class FoldSpec(BaseModel):
     """검증 폴드: 시험 운영일 구간 [test_start, test_end]."""
 

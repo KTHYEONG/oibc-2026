@@ -303,6 +303,64 @@ class ComposeConfig(BaseModel):
         return self
 
 
+class RegionalConfig(BaseModel):
+    """지역 집계 직접 예측 앙상블 파라미터(weight=0이면 비활성)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    weight: float = 0.0
+    units: tuple[tuple[int, int], ...] = ((2, 0), (4, 0), (4, 1), (8, 0), (8, 1), (8, 2), (12, 0), (16, 0), (16, 1))
+    sd_vars: tuple[str, ...] = ("wa_cloud_r17", "wb_cloud_r17", "wb_uv_idx_r17", "wa_cloud_r10", "wb_cloud_r10")
+    excluded_vars: tuple[str, ...] = ("capacity_kw", "lat", "lon")
+    ref_lat_deg: float = 36.5
+    kmeans_n_init: int = 10
+    learning_rate: float = 0.03
+    num_leaves: int = 31
+    min_child_samples: int = 50
+    subsample: float = 0.8
+    subsample_freq: int = 1
+    colsample_bytree: float = 0.8
+    reg_lambda: float = 0.0
+    n_rounds: int = 1500
+
+    @model_validator(mode="after")
+    def _check_regional(self) -> RegionalConfig:
+        if not isfinite(self.weight) or not 0.0 <= self.weight <= 1.0:
+            raise ValueError("weight must be finite and in [0, 1]")
+        if self.weight > 0.0 and len(self.units) == 0:
+            raise ValueError("units must not be empty when weight > 0")
+        seen: set[tuple[int, int]] = set()
+        for pair in self.units:
+            n_units, kmeans_seed = pair
+            if n_units < 1 or kmeans_seed < 0:
+                raise ValueError("units entries must satisfy n_units >= 1 and kmeans_seed >= 0")
+            if pair in seen:
+                raise ValueError("units must not contain duplicates")
+            seen.add(pair)
+        if len(set(self.sd_vars)) != len(self.sd_vars) or len(set(self.excluded_vars)) != len(self.excluded_vars):
+            raise ValueError("sd_vars and excluded_vars must not contain duplicates")
+        if not isfinite(self.ref_lat_deg) or not -90.0 < self.ref_lat_deg < 90.0:
+            raise ValueError("ref_lat_deg must be finite and in (-90, 90)")
+        if self.kmeans_n_init < 1:
+            raise ValueError("kmeans_n_init must be >= 1")
+        for name in ("learning_rate", "subsample", "colsample_bytree", "reg_lambda"):
+            if not isfinite(getattr(self, name)):
+                raise ValueError(f"{name} must be finite")
+        if not 0.0 < self.learning_rate <= 1.0:
+            raise ValueError("learning_rate must be in (0, 1]")
+        if self.num_leaves < 2:
+            raise ValueError("num_leaves must be >= 2")
+        if self.min_child_samples < 1 or self.subsample_freq < 0 or self.reg_lambda < 0:
+            raise ValueError("min_child_samples must be positive; subsample_freq and reg_lambda must be non-negative")
+        if not 0.0 < self.subsample <= 1.0:
+            raise ValueError("subsample must be in (0, 1]")
+        if not 0.0 < self.colsample_bytree <= 1.0:
+            raise ValueError("colsample_bytree must be in (0, 1]")
+        if self.n_rounds < 1:
+            raise ValueError("n_rounds must be >= 1")
+        return self
+
+
 class ModelConfig(BaseModel):
     """GBM 학습 파라미터·시드·가중치·타깃 설정."""
 
@@ -323,6 +381,7 @@ class ModelConfig(BaseModel):
     weight: Literal["smp_k_cap", "k_cap", "none"] = "smp_k_cap"
     target_clip_max: float = 1.2
     min_weight: float = 1e-3
+    regional: RegionalConfig = RegionalConfig()
 
     @model_validator(mode="after")
     def _check_model(self) -> ModelConfig:

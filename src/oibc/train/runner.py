@@ -116,16 +116,18 @@ def site_frame(day_rows: pd.DataFrame, day_pred_kwh: np.ndarray, night_rows: pd.
         len(night_actual) and not np.all(np.isfinite(night_actual))
     ):
         raise RunnerError("actual_kwh: must be finite")
-    site_ids = (
-        day_rows["site_id"].astype("string").tolist() + night_rows["site_id"].astype("string").tolist()
-    )
-    stamps = (
-        pd.DatetimeIndex(day_rows["ts"]).tolist() + pd.DatetimeIndex(night_rows["ts"]).tolist()
-    )
+    site_col = pd.concat(
+        [day_rows["site_id"].astype("string"), night_rows["site_id"].astype("string")],
+        ignore_index=True,
+    ).astype("string")
+    ts_col = pd.concat(
+        [rows["ts"].astype(_DT) if len(rows) else pd.Series(dtype=_DT) for rows in (day_rows, night_rows)],
+        ignore_index=True,
+    ).astype(_DT)
     out = pd.DataFrame(
         {
-            "site_id": pd.Series(site_ids, dtype="string"),
-            "ts": pd.Series(pd.DatetimeIndex(stamps), dtype=_DT),
+            "site_id": pd.Series(site_col, dtype="string"),
+            "ts": pd.Series(ts_col, dtype=_DT),
             "pred_kwh": pd.Series(
                 np.concatenate([preds, np.zeros(len(night_rows), dtype="float64")]),
                 dtype="float64",
@@ -547,6 +549,10 @@ def run_validation(
     if not night_all["site_id"].isin(assignment["site_id"]).all():
         raise RunnerError("generation: unknown site")
     features = feature_columns(panel, cfg.features)
+    keep = list(dict.fromkeys(["site_id", "ts", "op_date", "energy", "capacity_kw", "smp", "k", *features]))
+    train_panel = train_panel.loc[:, keep].copy()
+    del panel
+    gc.collect()
     metrics: dict[str, dict[str, float]] = {}
     bag_w: dict[str, dict[str, float]] = {}
     history_rows = pd.concat([train_panel[["site_id", "op_date"]], night_all[["site_id", "op_date"]]], ignore_index=True)
@@ -645,20 +651,27 @@ def run_validation(
             oof = pd.DataFrame(
                 {
                     "site_id": pd.Series(
-                        test_day["site_id"].astype("string").tolist()
-                        + night_fold["site_id"].astype("string").tolist(),
+                        pd.concat(
+                            [
+                                test_day["site_id"].astype("string"),
+                                night_fold["site_id"].astype("string"),
+                            ],
+                            ignore_index=True,
+                        ).astype("string"),
                         dtype="string",
                     ),
                     "ts": pd.Series(
-                        pd.DatetimeIndex(
-                            test_day["ts"].tolist() + night_fold["ts"].tolist()
-                        ),
+                        pd.concat(
+                            [test_day["ts"].astype(_DT), night_fold["ts"].astype(_DT)],
+                            ignore_index=True,
+                        ).astype(_DT),
                         dtype=_DT,
                     ),
                     "op_date": pd.Series(
-                        pd.DatetimeIndex(
-                            test_day["op_date"].tolist() + night_fold["op_date"].tolist()
-                        ),
+                        pd.concat(
+                            [test_day["op_date"].astype(_DT), night_fold["op_date"].astype(_DT)],
+                            ignore_index=True,
+                        ).astype(_DT),
                         dtype=_DT,
                     ),
                     "actual_kwh": pd.Series(
@@ -682,8 +695,7 @@ def run_validation(
                         dtype="float64",
                     ),
                     "is_warm": pd.Series(
-                        test_day["site_id"].astype("string").isin(warm_ids).tolist()
-                        + night_fold["site_id"].astype("string").isin(warm_ids).tolist(),
+                        np.concatenate([warm_day, warm_night]),
                         dtype="bool",
                     ),
                 }
@@ -755,6 +767,12 @@ def forecast_eval(
     features = feature_columns(panel, cfg.features)
     assignment, _ = _resolve_assignment(panel, cfg.composition_id, comp, paths)
     smp = _resolve_smp(panel, comp)
+    train_keep = list(dict.fromkeys([*features, "energy", "capacity_kw", "smp", "k"]))
+    eval_keep = list(dict.fromkeys([*features, "site_id", "ts", "capacity_kw"]))
+    train = train.loc[:, train_keep].copy()
+    eval_day = eval_day.loc[:, eval_keep].copy()
+    del panel
+    gc.collect()
     eval_ts = pd.DatetimeIndex(smp.loc[smp["period"] == "eval", "ts"]).sort_values()
     if not eval_ts.equals(pd.date_range(comp.eval_start, comp.eval_end, freq="h").as_unit("us")):
         raise RunnerError("smp: eval window mismatch")

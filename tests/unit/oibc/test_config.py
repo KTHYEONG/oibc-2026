@@ -3,7 +3,7 @@ import pytest
 from pathlib import Path
 from pydantic import ValidationError
 
-from src.oibc.config import ArtifactPaths, CompetitionSpec, ComposeConfig, DataPaths, FeatureConfig, FoldSpec, ModelConfig, RunConfig, ValidationConfig, repo_root
+from src.oibc.config import ArtifactPaths, CompetitionSpec, ComposeConfig, DataPaths, FeatureConfig, FoldSpec, ModelConfig, RegionalConfig, RunConfig, ValidationConfig, repo_root
 
 
 def test_default_spec_self_consistent() -> None:
@@ -365,3 +365,60 @@ def test_model_config_seed_workers_defaults() -> None:
     cfg = ModelConfig()
     assert cfg.seed_workers == 3
     assert cfg.n_jobs == 6
+
+
+def test_regional_default_disabled() -> None:
+    regional = ModelConfig().regional
+    assert regional.weight == 0.0
+    assert regional.units == ((2, 0), (4, 0), (4, 1), (8, 0), (8, 1), (8, 2), (12, 0), (16, 0), (16, 1))
+
+
+@pytest.mark.parametrize("weight", [-0.1, 1.1, float("nan")])
+def test_regional_weight_bounds_rejected(weight: float) -> None:
+    with pytest.raises(ValidationError, match="weight"):
+        RegionalConfig(weight=weight)
+
+
+@pytest.mark.parametrize("units", [[(0, 0)], [(4, -1)], [(4, 0), (4, 0)]])
+def test_regional_units_validation_rejected(units: list) -> None:
+    with pytest.raises(ValidationError, match="units"):
+        RegionalConfig(weight=0.5, units=units)  # type: ignore[arg-type]
+
+
+def test_regional_empty_units_with_positive_weight_rejected() -> None:
+    with pytest.raises(ValidationError, match="units"):
+        RegionalConfig(weight=0.5, units=())
+
+
+def test_regional_legacy_record_roundtrip() -> None:
+    data = RunConfig(run_id="r1", hypothesis="h").model_dump(mode="json")
+    data["model"].pop("regional")
+    assert RunConfig.model_validate(data).model.regional == RegionalConfig()
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"sd_vars": ("a", "a")},
+    {"excluded_vars": ("lat", "lat")},
+    {"ref_lat_deg": float("nan")},
+    {"ref_lat_deg": 90.0},
+    {"kmeans_n_init": 0},
+    {"learning_rate": 0.0},
+    {"learning_rate": 1.5},
+    {"num_leaves": 1},
+    {"min_child_samples": 0},
+    {"subsample_freq": -1},
+    {"reg_lambda": -1.0},
+    {"subsample": 0.0},
+    {"colsample_bytree": 0.0},
+    {"n_rounds": 0},
+])
+def test_regional_bounds_rejected(kwargs: dict) -> None:
+    with pytest.raises(ValidationError, match="must"):
+        RegionalConfig(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["learning_rate", "subsample", "colsample_bytree", "reg_lambda"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_regional_nonfinite_rejected(field: str, value: float) -> None:
+    with pytest.raises(ValidationError, match="finite"):
+        RegionalConfig(**{field: value})

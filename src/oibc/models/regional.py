@@ -104,28 +104,28 @@ def _panel_matrix(
         raise RegionalError("capacity_kw must be numeric") from exc
     if not np.isfinite(cap).all() or (cap <= 0).any():
         raise RegionalError("capacity_kw must be finite and positive")
-    site_ids = frame["site_id"].tolist()
-    try:
-        unit_arr = np.array([unit_of[s] for s in site_ids], dtype="int64")
-    except (KeyError, TypeError) as exc:
-        raise RegionalError("units must cover every site_id") from exc
+    site_pos = pd.Index(list(unit_of), dtype="object").get_indexer(frame["site_id"].astype("object"))
+    if (site_pos < 0).any():
+        raise RegionalError("units must cover every site_id")
+    unit_arr = np.fromiter(unit_of.values(), dtype="int64", count=len(unit_of))[site_pos]
     if frame["ts"].isna().any():
         raise RegionalError("ts must not contain missing values")
-    ts_list = frame["ts"].tolist()
     try:
-        uniq = sorted(set(zip(unit_arr.tolist(), ts_list, strict=True)), key=lambda p: (p[0], p[1]))
-    except TypeError as exc:
+        ts_i8 = pd.DatetimeIndex(frame["ts"]).as_unit("ns").asi8
+    except (TypeError, ValueError, OverflowError) as exc:
         raise RegionalError("ts values must be mutually comparable") from exc
-    code_of = {pair: i for i, pair in enumerate(uniq)}
-    row_code = np.array([code_of[(u, t)] for u, t in zip(unit_arr.tolist(), ts_list, strict=True)], dtype="int64")
-    n_panel = len(uniq)
-    panel_units = np.array([u for u, _ in uniq], dtype="int64")
+    # (unit, ts) 정렬 순서를 정수 키 하나로 만들어 Timestamp 객체 루프 없이 factorize한다.
+    ts_code, ts_uniq = pd.factorize(ts_i8, sort=True)
+    pair_key, row_code = np.unique(unit_arr * len(ts_uniq) + ts_code, return_inverse=True)
+    row_code = row_code.astype("int64", copy=False)
+    n_panel = len(pair_key)
+    panel_units = pair_key // len(ts_uniq)
     panel_cap = np.bincount(row_code, weights=cap, minlength=n_panel).astype("float64")
-    try:
-        panel_lat = np.asarray([centroids.loc[u, "unit_lat"] for u in panel_units], dtype="float64")
-        panel_lon = np.asarray([centroids.loc[u, "unit_lon"] for u in panel_units], dtype="float64")
-    except KeyError as exc:
-        raise RegionalError("centroids must cover every unit") from exc
+    cen_pos = centroids.index.get_indexer(panel_units)
+    if (cen_pos < 0).any():
+        raise RegionalError("centroids must cover every unit")
+    panel_lat = centroids["unit_lat"].to_numpy(dtype="float64")[cen_pos]
+    panel_lon = centroids["unit_lon"].to_numpy(dtype="float64")[cen_pos]
     means: dict[str, np.ndarray] = {}
     sum_sq: dict[str, np.ndarray] = {}
     for col in mean_cols:
@@ -253,6 +253,8 @@ def fit_predict_regional(
                 "subsample_freq": cfg.subsample_freq,
                 "colsample_bytree": cfg.colsample_bytree,
                 "reg_lambda": cfg.reg_lambda,
+                # 자동 col/row-wise 선택은 실행 시간 측정으로 정해져 프로세스마다 결과가 달라진다.
+                "force_col_wise": True,
                 "num_threads": threads,
                 "seed": seed,
                 "verbose": -1,

@@ -274,6 +274,36 @@ def test_deterministic_output() -> None:
     assert first.shape == (len(cfg.seeds), len(test))
 
 
+def test_fit_pins_col_wise_histogram(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.models.regional as regional_mod
+
+    seen: list[dict[str, object]] = []
+    real_train = regional_mod.lgb.train
+
+    def _spy(params: dict[str, object], *args: object, **kwargs: object) -> object:
+        seen.append(dict(params))
+        return real_train(params, *args, **kwargs)
+
+    monkeypatch.setattr(regional_mod.lgb, "train", _spy)
+    geo = _geo()
+    fit_predict_regional(_frame(geo, labeled=True), _frame(geo, seed=7, labeled=False), FEATURES, geo, _cfg())
+    assert seen
+    assert all(p.get("force_col_wise") is True for p in seen)
+
+
+def test_panel_matrix_row_order_matches_sorted_unit_ts() -> None:
+    geo, unit_of, centroids = _panel_parts()
+    frame = _frame(geo, labeled=False)
+    shuffled = frame.sample(frac=1.0, random_state=3).reset_index(drop=True)
+    mat, _, code, cap, units = _panel_matrix(shuffled, FEATURES, ("f0",), unit_of, centroids)
+    ts_sorted = sorted(shuffled["ts"].unique())
+    expected = [ts_sorted.index(t) for t in shuffled["ts"]]
+    assert code.tolist() == expected
+    assert (units == 0).all()
+    assert np.allclose(cap, shuffled.groupby("ts")["capacity_kw"].sum().sort_index().to_numpy())
+    assert mat.shape[0] == len(ts_sorted)
+
+
 def test_blend_zero_weight_identity() -> None:
     rng = np.random.default_rng(0)
     plant = np.abs(rng.normal(size=(3, 10)))

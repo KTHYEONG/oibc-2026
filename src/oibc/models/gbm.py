@@ -114,6 +114,8 @@ def fit_seed_models(train: pd.DataFrame, features: Sequence[str], cfg: ModelConf
             "subsample_freq": cfg.subsample_freq,
             "colsample_bytree": cfg.colsample_bytree,
             "reg_lambda": cfg.reg_lambda,
+            # 자동 col/row-wise 선택은 실행 시간 측정으로 정해져 프로세스마다 결과가 달라진다.
+            "force_col_wise": True,
             "num_threads": threads,
             "seed": seed,
             "verbose": -1,

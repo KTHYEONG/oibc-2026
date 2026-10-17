@@ -319,3 +319,19 @@ def test_training_respects_thread_budget(
     for arrays in zip(*inputs, strict=True):
         assert all(array is arrays[0] for array in arrays)
         assert not arrays[0].flags.writeable
+
+
+def test_fit_pins_col_wise_histogram(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.models.gbm as gbm_mod
+
+    seen: list[dict[str, object]] = []
+    real_train = gbm_mod.lgb.train
+
+    def _spy(params, *args, **kwargs):  # type: ignore[no-untyped-def]
+        seen.append(dict(params))
+        return real_train(params, *args, **kwargs)
+
+    monkeypatch.setattr(gbm_mod.lgb, "train", _spy)
+    fit_seed_models(_panel(n=100), FEATURES, _cfg(seeds=(0, 1)))
+    assert len(seen) == 2
+    assert all(p.get("force_col_wise") is True for p in seen)

@@ -526,3 +526,31 @@ def test_pipeline_report_netting_writes_json(tmp_path: Path, monkeypatch: pytest
     with pytest.raises(FileExistsError):
         main(["report-netting", "--run-id", "r1", "--composition", "current_group", "--n-random", "4", "--seed", "0"])
     assert out.read_bytes() == before
+
+
+def test_validate_run_regional_weight_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.config import RegionalConfig
+
+    calls: list[object] = []
+    monkeypatch.setattr(runner_mod, "run_validation", lambda cfg, **k: calls.append(cfg))
+    assert main(["validate-run", "--run-id", "r1", "--hypothesis", "h", "--regional-weight", "0.6"]) == 0
+    assert len(calls) == 1
+    assert calls[0].model.regional.weight == 0.6
+    assert calls[0].model.regional == RegionalConfig(weight=0.6)
+
+
+def test_validate_run_regional_default_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.config import RegionalConfig
+
+    calls: list[object] = []
+    monkeypatch.setattr(runner_mod, "run_validation", lambda cfg, **k: calls.append(cfg))
+    assert main(["validate-run", "--run-id", "r1", "--hypothesis", "h"]) == 0
+    assert calls[0].model.regional == RegionalConfig()
+
+
+def test_validate_run_regional_weight_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(runner_mod, "run_validation", lambda cfg, **k: calls.append(cfg))
+    with pytest.raises(ValueError, match="weight"):
+        main(["validate-run", "--run-id", "r1", "--hypothesis", "h", "--regional-weight", "1.5"])
+    assert calls == []

@@ -31,6 +31,7 @@ from src.oibc.evaluate.registry import ExperimentRecord, append_record, read_rec
 from src.oibc.evaluate.settlement import aggregate_groups, daily_totals, settle
 from src.oibc.features.panel import feature_columns
 from src.oibc.models.gbm import bag, fit_seed_models, predict_seed_kwh
+from src.oibc.models.regional import blend_seed_preds, fit_predict_regional
 from src.oibc.timeaxis import k_weight, op_date, require_hourly_kst
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,45 @@ class RunnerError(ValueError):
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise RunnerError(message)
+
+
+def _site_geo(panel: pd.DataFrame) -> pd.DataFrame:
+    """패널 전체에서 site별 정적 표를 반환한다."""
+    for col in ("site_id", "lat", "lon", "capacity_kw"):
+        if col not in panel.columns:
+            raise RunnerError(f"panel: missing {col}")
+    if panel.empty:
+        raise RunnerError("panel: empty")
+    site_ids = panel["site_id"].astype("string")
+    if site_ids.isna().any() or bool((site_ids == "").any()):
+        raise RunnerError("panel: missing site_id")
+    lat = pd.to_numeric(panel["lat"], errors="coerce").to_numpy(dtype="float64")
+    lon = pd.to_numeric(panel["lon"], errors="coerce").to_numpy(dtype="float64")
+    cap = pd.to_numeric(panel["capacity_kw"], errors="coerce").to_numpy(dtype="float64")
+    if not np.all(np.isfinite(lat)) or not np.all(np.isfinite(lon)):
+        raise RunnerError("panel: site lat/lon must be finite")
+    if not np.all(np.isfinite(cap)) or bool((cap <= 0).any()):
+        raise RunnerError("panel: site capacity_kw must be finite and > 0")
+    work = pd.DataFrame(
+        {
+            "site_id": site_ids.reset_index(drop=True),
+            "lat": lat,
+            "lon": lon,
+            "capacity_kw": cap,
+        }
+    )
+    nunique = work.groupby("site_id", observed=True)[["lat", "lon", "capacity_kw"]].nunique(dropna=False)
+    if bool((nunique != 1).any().any()):
+        raise RunnerError("panel: inconsistent site_geo within site")
+    out = work.drop_duplicates(subset=["site_id"]).sort_values("site_id", kind="mergesort").reset_index(drop=True)
+    return pd.DataFrame(
+        {
+            "site_id": out["site_id"].astype("string"),
+            "lat": out["lat"].to_numpy(dtype="float64"),
+            "lon": out["lon"].to_numpy(dtype="float64"),
+            "capacity_kw": out["capacity_kw"].to_numpy(dtype="float64"),
+        }
+    )
 
 
 def reference_assignment(sites: pd.DataFrame) -> pd.DataFrame:
@@ -532,6 +572,7 @@ def run_validation(
             raise RunnerError(f"registry: unknown baseline {cfg.baseline_run_id!r}")
         config_diff = _check_comparable(matches[0], cfg, panel_hash, val, comp)
     panel = _load_panel(panel_file, cfg, comp)
+    site_geo = _site_geo(panel) if cfg.model.regional.weight > 0 else None
     features = feature_columns(panel, cfg.features)
     keep = list(dict.fromkeys(["site_id", "ts", "op_date", "energy", "capacity_kw", "smp", "k", *features]))
     train_panel = panel.loc[panel["period"] == "train", keep].reset_index(drop=True)
@@ -573,6 +614,13 @@ def run_validation(
         models = fit_seed_models(train_fold, features, cfg.model)
         fit_sec = time.perf_counter() - t0
         preds = predict_seed_kwh(models, test_day, features, num_threads=cfg.model.n_jobs)
+        del models
+        if site_geo is not None:
+            t1 = time.perf_counter()
+            reg = fit_predict_regional(train_fold, test_day, features, site_geo, cfg.model)
+            preds = blend_seed_preds(preds, reg, cfg.model.regional.weight)
+            regional_sec = time.perf_counter() - t1
+            del reg
         night_mask = (night_all["op_date"] >= fold.test_start) & (night_all["op_date"] <= fold.test_end)
         night_fold = night_all.loc[night_mask].reset_index(drop=True)
         test_ts = pd.DatetimeIndex(test_day["ts"].unique()).union(
@@ -606,6 +654,8 @@ def run_validation(
                         "revenue_all": float(daily["revenue"].sum()),
                         "fit_sec": float(fit_sec),
                     }
+                    if site_geo is not None:
+                        metrics[f"{fold.name}/{seed}"]["regional_sec"] = float(regional_sec)
                 else:
                     metrics[f"{fold.name}/{seed}"]["W_warm"] = float(daily["penalty"].sum())
                 if subset == "warm":
@@ -708,7 +758,7 @@ def run_validation(
                 cfg.run_id, fold.name, len(oof), int(oof["site_id"].nunique()),
             )
             del oof
-        del models, preds, bag_pred, train_fold, test_day
+        del preds, bag_pred, train_fold, test_day
         gc.collect()
     comparison: dict[str, object] = {"bag": bag_w, "config_diff": config_diff}
     if cfg.baseline_run_id is not None:
@@ -762,8 +812,9 @@ def forecast_eval(
     comp = spec if spec is not None else CompetitionSpec()
     panel_file = panel_path if panel_path is not None else _default_panel_path()
     panel = _load_panel(panel_file, cfg, comp)
+    site_geo = _site_geo(panel) if cfg.model.regional.weight > 0 else None
     features = feature_columns(panel, cfg.features)
-    train_keep = list(dict.fromkeys([*features, "energy", "capacity_kw", "smp", "k"]))
+    train_keep = list(dict.fromkeys([*features, "site_id", "ts", "energy", "capacity_kw", "smp", "k"]))
     eval_keep = list(dict.fromkeys([*features, "site_id", "ts", "capacity_kw"]))
     train = panel.loc[panel["period"] == "train", train_keep].reset_index(drop=True)
     eval_day = panel.loc[panel["period"] == "eval", eval_keep].reset_index(drop=True)
@@ -794,10 +845,17 @@ def forecast_eval(
     gc.collect()
     models = fit_seed_models(train, features, cfg.model)
     preds = predict_seed_kwh(models, eval_day, features, num_threads=cfg.model.n_jobs)
+    del models
+    if site_geo is not None:
+        preds = blend_seed_preds(
+            preds,
+            fit_predict_regional(train, eval_day, features, site_geo, cfg.model),
+            cfg.model.regional.weight,
+        )
     mean = bag(preds)
     if mean.shape != (len(eval_day),) or not np.isfinite(mean).all() or (mean < 0).any():
         raise RunnerError("forecast: invalid seed-bag predictions")
-    del models, preds
+    del preds
     gc.collect()
     day = eval_day[["site_id", "ts"]].assign(forecast_kwh=mean)
     full = grid[["site_id", "ts"]].merge(day, on=["site_id", "ts"], how="left", validate="one_to_one")

@@ -348,6 +348,78 @@ class ComposeConfig(BaseModel):
         return self
 
 
+class FamilyConfig(BaseModel):
+    """지역 단위 CatBoost·MLP 구성원과 최종 혼합 비율(둘 다 0이면 비활성)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    cat_weight: float = 0.0
+    mlp_weight: float = 0.0
+    cat_units: tuple[tuple[int, int], ...] = ((8, 0),)
+    cat_seeds: tuple[int, ...] = (0, 1)
+    cat_iterations: int = 2000
+    cat_learning_rate: float = 0.05
+    cat_depth: int = 8
+    mlp_units: tuple[tuple[int, int], ...] = ((4, 0), (8, 0), (16, 0))
+    mlp_seeds: tuple[int, ...] = (0, 1, 2, 3, 4)
+    mlp_hidden: tuple[int, ...] = (256, 128, 64)
+    mlp_alpha: float = 1e-4
+    mlp_batch_size: int = 512
+    mlp_learning_rate_init: float = 1e-3
+    mlp_max_iter: int = 200
+    mlp_validation_fraction: float = 0.1
+    mlp_n_iter_no_change: int = 15
+
+    @model_validator(mode="after")
+    def _check_families(self) -> FamilyConfig:
+        for name in ("cat_weight", "mlp_weight"):
+            if not isfinite(getattr(self, name)) or not 0.0 <= getattr(self, name) <= 1.0:
+                raise ValueError(f"{name} must be finite and in [0, 1]")
+        if not self.cat_weight + self.mlp_weight < 1.0:
+            raise ValueError("cat_weight + mlp_weight must be < 1.0")
+        for prefix in ("cat", "mlp"):
+            weight = getattr(self, f"{prefix}_weight")
+            units = getattr(self, f"{prefix}_units")
+            seeds = getattr(self, f"{prefix}_seeds")
+            if weight > 0.0 and len(units) == 0:
+                raise ValueError(f"{prefix}_units must not be empty when {prefix}_weight > 0")
+            seen: set[tuple[int, int]] = set()
+            for pair in units:
+                n_units, kmeans_seed = pair
+                if n_units < 1 or kmeans_seed < 0:
+                    raise ValueError(f"{prefix}_units entries must satisfy n_units >= 1 and kmeans_seed >= 0")
+                if pair in seen:
+                    raise ValueError(f"{prefix}_units must not contain duplicates")
+                seen.add(pair)
+            if len(set(seeds)) != len(seeds):
+                raise ValueError(f"{prefix}_seeds must not contain duplicates")
+            if any(s < 0 for s in seeds):
+                raise ValueError(f"{prefix}_seeds must be non-negative")
+            if weight > 0.0 and len(seeds) == 0:
+                raise ValueError(f"{prefix}_seeds must not be empty when {prefix}_weight > 0")
+        if self.cat_iterations < 1:
+            raise ValueError("cat_iterations must be >= 1")
+        if not 1 <= self.cat_depth <= 16:
+            raise ValueError("cat_depth must be in [1, 16]")
+        if not isfinite(self.cat_learning_rate) or not 0.0 < self.cat_learning_rate <= 1.0:
+            raise ValueError("cat_learning_rate must be finite and in (0, 1]")
+        if len(self.mlp_hidden) == 0 or any(h < 1 for h in self.mlp_hidden):
+            raise ValueError("mlp_hidden must be non-empty with all entries >= 1")
+        if not isfinite(self.mlp_alpha) or self.mlp_alpha < 0.0:
+            raise ValueError("mlp_alpha must be finite and >= 0")
+        if self.mlp_batch_size < 1:
+            raise ValueError("mlp_batch_size must be >= 1")
+        if not isfinite(self.mlp_learning_rate_init) or not 0.0 < self.mlp_learning_rate_init <= 1.0:
+            raise ValueError("mlp_learning_rate_init must be finite and in (0, 1]")
+        if self.mlp_max_iter < 1:
+            raise ValueError("mlp_max_iter must be >= 1")
+        if not isfinite(self.mlp_validation_fraction) or not 0.0 < self.mlp_validation_fraction < 1.0:
+            raise ValueError("mlp_validation_fraction must be finite and in (0, 1)")
+        if self.mlp_n_iter_no_change < 1:
+            raise ValueError("mlp_n_iter_no_change must be >= 1")
+        return self
+
+
 class RegionalConfig(BaseModel):
     """지역 집계 직접 예측 앙상블 파라미터(weight=0이면 비활성)."""
 
@@ -427,6 +499,7 @@ class ModelConfig(BaseModel):
     target_clip_max: float = 1.2
     min_weight: float = 1e-3
     regional: RegionalConfig = RegionalConfig()
+    families: FamilyConfig = FamilyConfig()
 
     @model_validator(mode="after")
     def _check_model(self) -> ModelConfig:

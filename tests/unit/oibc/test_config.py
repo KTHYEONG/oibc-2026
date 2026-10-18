@@ -459,3 +459,124 @@ def test_calibration_bounds_rejected(kwargs: dict) -> None:
 
     with pytest.raises(ValueError, match=r"."):
         CalibrationConfig(**kwargs)
+
+
+def test_family_config_defaults_inactive() -> None:
+    from src.oibc.config import FamilyConfig
+
+    cfg = FamilyConfig()
+    assert cfg.cat_weight == cfg.mlp_weight == 0.0
+    assert cfg.mlp_units == ((4, 0), (8, 0), (16, 0))
+    assert len(cfg.mlp_seeds) == 5
+    assert cfg.cat_units == ((8, 0),)
+
+
+def test_family_weights_sum_below_one() -> None:
+    from src.oibc.config import FamilyConfig
+
+    with pytest.raises(ValueError, match=r"1\.0"):
+        FamilyConfig(cat_weight=0.5, mlp_weight=0.5)
+    FamilyConfig(cat_weight=0.2, mlp_weight=0.2)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"cat_weight": -0.1},
+    {"cat_weight": float("nan")},
+    {"cat_weight": 1.5},
+])
+def test_family_weight_bounds(kwargs: dict) -> None:
+    from src.oibc.config import FamilyConfig
+
+    with pytest.raises(ValueError, match="weight"):
+        FamilyConfig(**kwargs)
+
+
+def test_active_family_requires_units() -> None:
+    from src.oibc.config import FamilyConfig
+
+    with pytest.raises(ValueError, match="units"):
+        FamilyConfig(mlp_weight=0.2, mlp_units=())
+    FamilyConfig(mlp_weight=0.0, mlp_units=())
+
+
+def test_family_duplicate_units_rejected() -> None:
+    from src.oibc.config import FamilyConfig
+
+    with pytest.raises(ValueError, match="duplicates"):
+        FamilyConfig(cat_units=((8, 0), (8, 0)))
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"mlp_validation_fraction": 1.0},
+    {"mlp_hidden": ()},
+    {"mlp_hidden": (0,)},
+])
+def test_family_mlp_hyperparameter_bounds(kwargs: dict) -> None:
+    from src.oibc.config import FamilyConfig
+
+    with pytest.raises(ValueError, match=r"must"):
+        FamilyConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_model_config_carries_families() -> None:
+    assert ModelConfig().model_dump(mode="json")["families"]["cat_weight"] == 0.0
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"cat_units": ((0, 0),)},
+    {"cat_units": ((8, -1),)},
+    {"mlp_units": ((0, 1),)},
+])
+def test_family_bad_unit_entries_rejected(kwargs: dict) -> None:
+    from src.oibc.config import FamilyConfig
+
+    with pytest.raises(ValueError, match="n_units"):
+        FamilyConfig(**kwargs)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"cat_seeds": (0, 0)},
+    {"mlp_seeds": (2, 2)},
+])
+def test_family_duplicate_seeds_rejected(kwargs: dict) -> None:
+    from src.oibc.config import FamilyConfig
+
+    with pytest.raises(ValueError, match="seeds"):
+        FamilyConfig(**kwargs)
+
+
+def test_family_negative_seeds_rejected() -> None:
+    from src.oibc.config import FamilyConfig
+
+    with pytest.raises(ValueError, match="non-negative"):
+        FamilyConfig(cat_seeds=(-1,))
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"cat_weight": 0.3, "cat_seeds": ()},
+    {"mlp_weight": 0.3, "mlp_seeds": ()},
+])
+def test_family_active_member_requires_seeds(kwargs: dict) -> None:
+    from src.oibc.config import FamilyConfig
+
+    with pytest.raises(ValueError, match="seeds"):
+        FamilyConfig(**kwargs)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"cat_iterations": 0},
+    {"cat_depth": 0},
+    {"cat_depth": 17},
+    {"cat_learning_rate": 0.0},
+    {"cat_learning_rate": 1.5},
+    {"mlp_alpha": -0.5},
+    {"mlp_batch_size": 0},
+    {"mlp_learning_rate_init": 0.0},
+    {"mlp_max_iter": 0},
+    {"mlp_n_iter_no_change": 0},
+])
+def test_family_hyperparameter_bounds_rejected(kwargs: dict) -> None:
+    from src.oibc.config import FamilyConfig
+
+    with pytest.raises(ValueError, match=r"must"):
+        FamilyConfig(**kwargs)  # type: ignore[arg-type]

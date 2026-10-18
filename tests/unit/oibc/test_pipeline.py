@@ -727,3 +727,30 @@ def test_submit_calibration_guard_rejects(tmp_path: Path, monkeypatch: pytest.Mo
     monkeypatch.setattr(runner_mod, "forecast_eval", no_forecast)
     with pytest.raises(runner_mod.RunnerError):
         main(["submit", "--run-id", "r1", "--sub-id", "s1", "--calibration"])
+
+
+def test_validate_run_passes_family_weights(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(runner_mod, "run_validation", lambda cfg, **k: calls.append(cfg))
+    assert main(["validate-run", "--run-id", "r1", "--hypothesis", "h", "--cat-weight", "0.2", "--mlp-weight", "0.2"]) == 0
+    assert len(calls) == 1
+    assert calls[0].model.families.cat_weight == 0.2
+    assert calls[0].model.families.mlp_weight == 0.2
+
+
+def test_validate_run_family_weights_default_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(runner_mod, "run_validation", lambda cfg, **k: calls.append(cfg))
+    assert main(["validate-run", "--run-id", "r1", "--hypothesis", "h"]) == 0
+    assert calls[0].model.families.cat_weight == 0.0
+    assert calls[0].model.families.mlp_weight == 0.0
+
+
+def test_validate_run_rejects_family_weight_sum(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pydantic import ValidationError
+
+    calls: list[object] = []
+    monkeypatch.setattr(runner_mod, "run_validation", lambda cfg, **k: calls.append(cfg))
+    with pytest.raises(ValidationError):
+        main(["validate-run", "--run-id", "r1", "--hypothesis", "h", "--cat-weight", "0.6", "--mlp-weight", "0.5"])
+    assert calls == []

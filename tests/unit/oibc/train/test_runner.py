@@ -2578,3 +2578,251 @@ def test_calibration_report_serialization_guard(tmp_path: Path, monkeypatch: pyt
     with pytest.raises(RunnerError, match="serializable"):
         cal_mod.calibration_report("caljson", paths=paths, vcfg=vcfg)
     monkeypatch.setattr(cal_mod.json, "dumps", _json.dumps)
+
+
+def _family_feat() -> FeatureConfig:
+    base = _feat()
+    return FeatureConfig(
+        groups=frozenset({"cs"}),
+        neighbor_vars=base.neighbor_vars,
+        rd_vars=base.rd_vars,
+        day_mean_vars=base.day_mean_vars,
+        day_max_vars=base.day_max_vars,
+        day_sum_vars=base.day_sum_vars,
+        fleet_vars=base.fleet_vars,
+        vsfleet_vars=base.vsfleet_vars,
+        wa_vars=base.wa_vars,
+        wb_vars=base.wb_vars,
+    )
+
+
+def _make_family_panel(tmp_path: Path) -> Path:
+    from src.oibc.features.panel import feature_columns
+
+    path = _make_panel(tmp_path)
+    panel = pd.read_parquet(path)
+    for col in (
+        "cs_ghi",
+        "cs_clear_wa_r10",
+        "cs_clear_wa_r17",
+        "cs_clear_wb_r10",
+        "cs_clear_wb_r17",
+        "uv_per_cosz_r10",
+        "uv_per_cosz_r17",
+    ):
+        if col not in panel.columns:
+            panel[col] = np.float32(500.0 if col == "cs_ghi" else 0.5)
+    panel.to_parquet(path, index=False)
+    feature_columns(panel, _family_feat())
+    return path
+
+
+def _family_cfg(run_id: str, cat_weight: float, mlp_weight: float, regional_weight: float = 0.6) -> RunConfig:
+    from src.oibc.config import FamilyConfig, RegionalConfig
+
+    return _cfg(
+        run_id,
+        features=_family_feat(),
+        model=ModelConfig(
+            n_rounds=3,
+            num_leaves=4,
+            n_jobs=1,
+            min_child_samples=5,
+            seeds=(0, 1),
+            regional=RegionalConfig(
+                weight=regional_weight,
+                units=((1, 0), (2, 0)),
+                kmeans_n_init=1,
+                num_leaves=4,
+                min_child_samples=5,
+                n_rounds=3,
+            ),
+            families=FamilyConfig(
+                cat_weight=cat_weight,
+                mlp_weight=mlp_weight,
+                cat_units=((2, 0),),
+                cat_seeds=(0, 1),
+                cat_iterations=20,
+                mlp_units=((2, 0),),
+                mlp_seeds=(0, 1),
+                mlp_hidden=(8,),
+                mlp_max_iter=5,
+            ),
+        ),
+    )
+
+
+def test_run_validation_families_inactive_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.config import FamilyConfig
+
+    panel = _make_family_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+
+    def no_family(*args: object, **kwargs: object) -> None:
+        pytest.fail("비활성 계열 호출")
+
+    for name in ("fit_predict_catboost", "fit_predict_mlp", "blend_families"):
+        monkeypatch.setattr(runner_mod, name, no_family)
+    cfg = _family_cfg("fam0", 0.0, 0.0)
+    regional = cfg.model_copy(update={
+        "run_id": "regonly",
+        "model": cfg.model.model_copy(update={"families": FamilyConfig()}),
+    })
+    rec = run_validation(cfg, panel_path=panel, vcfg=vcfg, paths=paths, save_oof=True)
+    ref = run_validation(regional, panel_path=panel, vcfg=vcfg, paths=paths, save_oof=True)
+    assert all("family_sec" not in m for r in (rec, ref) for m in r.metrics.values())
+    assert rec.comparison["bag"] == ref.comparison["bag"]
+    for fold in vcfg.folds:
+        pd.testing.assert_frame_equal(
+            load_oof("fam0", fold.name, paths=paths),
+            load_oof("regonly", fold.name, paths=paths),
+            check_exact=True,
+        )
+
+
+def test_run_validation_records_family_seconds(tmp_path: Path) -> None:
+    panel = _make_family_panel(tmp_path)
+    paths = _paths(tmp_path)
+    run_validation(_family_cfg("fam1", 0.2, 0.2), panel_path=panel, vcfg=_vcfg(), paths=paths)
+    from src.oibc.evaluate.registry import read_records
+
+    rec = next(r for r in read_records(paths.registry) if r.run_id == "fam1")
+    assert rec.config["model"]["families"]["cat_weight"] == 0.2
+    assert rec.metrics and all(m["family_sec"] > 0 for m in rec.metrics.values())
+
+
+def test_run_validation_blends_family_members(tmp_path: Path) -> None:
+    from src.oibc.cv.splits import fold_masks
+    from src.oibc.features.panel import feature_columns
+    from src.oibc.models.families import fit_predict_catboost, fit_predict_mlp
+
+    panel = _make_family_panel(tmp_path)
+    paths = _paths(tmp_path)
+    vcfg = _vcfg()
+    run_validation(_family_cfg("basefam", 0.0, 0.0), panel_path=panel, vcfg=vcfg, paths=paths, save_oof=True)
+    cand = _family_cfg("candfam", 0.2, 0.2)
+    run_validation(cand, panel_path=panel, vcfg=vcfg, paths=paths, save_oof=True)
+    full = pd.read_parquet(panel)
+    features = feature_columns(full, cand.features)
+    site_geo = runner_mod._site_geo(full)
+    train_all = full.loc[full["period"] == "train"].reset_index(drop=True)
+    for fold in vcfg.folds:
+        train_mask, test_mask = fold_masks(train_all["op_date"], fold, vcfg)
+        train_fold = train_all.loc[train_mask].reset_index(drop=True)
+        test_day = train_all.loc[test_mask].reset_index(drop=True)
+        cat = fit_predict_catboost(train_fold, test_day, features, site_geo, cand.model)
+        mlp = fit_predict_mlp(train_fold, test_day, features, site_geo, cand.model)
+        keys = test_day[["site_id", "ts"]].copy()
+        keys["cat"] = cat
+        keys["mlp"] = mlp
+        base_oof = load_oof("basefam", fold.name, paths=paths)
+        cand_oof = load_oof("candfam", fold.name, paths=paths)
+        day_hours = (11, 12, 13)
+        for frame in (base_oof, cand_oof):
+            night = frame.loc[~frame["ts"].dt.hour.isin(day_hours)]
+            assert len(night) > 0
+            assert bool((night["pred_bag"] == 0.0).all())
+        merged = (
+            base_oof[["site_id", "ts", "pred_bag"]]
+            .merge(cand_oof[["site_id", "ts", "pred_bag"]], on=["site_id", "ts"], suffixes=("_base", "_cand"))
+            .merge(keys, on=["site_id", "ts"])
+        )
+        day = merged.loc[merged["ts"].dt.hour.isin(day_hours)]
+        assert len(day) > 0
+        expected = 0.6 * day["pred_bag_base"].to_numpy() + 0.2 * day["cat"].to_numpy() + 0.2 * day["mlp"].to_numpy()
+        np.testing.assert_allclose(day["pred_bag_cand"].to_numpy(), expected, rtol=1e-9)
+
+
+def test_run_validation_families_without_regional(tmp_path: Path) -> None:
+    panel = _make_family_panel(tmp_path)
+    paths = _paths(tmp_path)
+    run_validation(_family_cfg("fam_noreg", 0.0, 0.3, regional_weight=0.0), panel_path=panel, vcfg=_vcfg(), paths=paths)
+
+
+def test_run_validation_wraps_family_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.models.families import FamilyError
+
+    panel = _make_family_panel(tmp_path)
+    paths = _paths(tmp_path)
+
+    def _boom(*args: object, **kwargs: object) -> np.ndarray:
+        raise FamilyError("boom-family")
+
+    monkeypatch.setattr(runner_mod, "fit_predict_catboost", _boom)
+    with pytest.raises(RunnerError, match="boom-family"):
+        run_validation(_family_cfg("famerr", 0.2, 0.0), panel_path=panel, vcfg=_vcfg(), paths=paths)
+
+
+def test_forecast_eval_applies_families(tmp_path: Path) -> None:
+    from src.oibc.features.panel import feature_columns
+    from src.oibc.models.families import blend_families, fit_predict_catboost, fit_predict_mlp
+    from src.oibc.models.gbm import bag, fit_seed_models, predict_seed_kwh
+    from src.oibc.models.regional import blend_seed_preds, fit_predict_regional
+
+    panel = _make_family_panel(tmp_path)
+    spec = _spec()
+    cfg = _family_cfg("famfc", 0.2, 0.2)
+    out = forecast_eval(cfg, panel_path=panel, spec=spec)
+    assert set(out["group"].tolist()) == {"G1", "G2"}
+    assert str(out["forecast_kwh"].dtype) == "float64"
+    assert str(out["ts"].dtype) == _DT
+    assert (out["forecast_kwh"] >= 0).all() and np.isfinite(out["forecast_kwh"].to_numpy()).all()
+    eval_ts = pd.date_range(spec.eval_start, spec.eval_end, freq="h").as_unit("us")
+    for group in ("G1", "G2"):
+        got = pd.DatetimeIndex(out.loc[out["group"] == group, "ts"]).sort_values()
+        assert got.equals(eval_ts)
+    assert out["forecast_kwh"].sum() > 0.0
+    base = forecast_eval(_family_cfg("basefc", 0.0, 0.0), panel_path=panel, spec=spec)
+    merged = out.merge(base, on=["group", "ts"], suffixes=("_fam", "_base"))
+    assert bool((merged["forecast_kwh_fam"] != merged["forecast_kwh_base"]).any())
+    full = pd.read_parquet(panel)
+    features = feature_columns(full, cfg.features)
+    geo = runner_mod._site_geo(full)
+    train = full.loc[full["period"] == "train"].reset_index(drop=True)
+    day = full.loc[full["period"] == "eval"].reset_index(drop=True)
+    preds = predict_seed_kwh(fit_seed_models(train, features, cfg.model), day, features, num_threads=1)
+    preds = blend_seed_preds(preds, fit_predict_regional(train, day, features, geo, cfg.model), 0.6)
+    mean = bag(blend_families(
+        preds,
+        fit_predict_catboost(train, day, features, geo, cfg.model),
+        fit_predict_mlp(train, day, features, geo, cfg.model),
+        cfg.model.families,
+    ))
+    expected = day[["ts"]].assign(pred=mean).groupby("ts")["pred"].sum()
+    actual = out.groupby("ts")["forecast_kwh"].sum()
+    np.testing.assert_allclose(actual.reindex(expected.index), expected, rtol=1e-9)
+    assert actual.loc[~actual.index.isin(expected.index)].eq(0.0).all()
+
+
+@pytest.mark.parametrize("family", ["cat", "mlp"])
+@pytest.mark.parametrize("evaluation", [False, True])
+def test_single_family_skips_inactive_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, family: str, evaluation: bool,
+) -> None:
+    panel = _make_family_panel(tmp_path)
+    cfg = _family_cfg("single", 0.3 if family == "cat" else 0.0, 0.3 if family == "mlp" else 0.0, 0.0)
+
+    def no_fit(*args: object, **kwargs: object) -> None:
+        pytest.fail("비활성 모델 학습")
+
+    monkeypatch.setattr(runner_mod, "fit_predict_regional", no_fit)
+    monkeypatch.setattr(runner_mod, "fit_predict_mlp" if family == "cat" else "fit_predict_catboost", no_fit)
+    if evaluation:
+        forecast_eval(cfg, panel_path=panel, spec=_spec())
+    else:
+        rec = run_validation(cfg, panel_path=panel, vcfg=_vcfg(), paths=_paths(tmp_path))
+        assert all("regional_sec" not in m and m["family_sec"] > 0 for m in rec.metrics.values())
+
+
+def test_forecast_eval_wraps_family_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.models.families import FamilyError
+
+    panel = _make_family_panel(tmp_path)
+
+    def _boom(*args: object, **kwargs: object) -> np.ndarray:
+        raise FamilyError("boom-forecast-family")
+
+    monkeypatch.setattr(runner_mod, "fit_predict_catboost", _boom)
+    with pytest.raises(RunnerError, match="boom-forecast-family"):
+        forecast_eval(_family_cfg("famerrfc", 0.2, 0.0), panel_path=panel, spec=_spec())

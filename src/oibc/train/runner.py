@@ -40,6 +40,7 @@ from src.oibc.models.calibrate import (
     fit_cloud_calibration,
     scale_factors,
 )
+from src.oibc.models.families import FamilyError, blend_families, fit_predict_catboost, fit_predict_mlp
 from src.oibc.models.gbm import bag, fit_seed_models, predict_seed_kwh
 from src.oibc.models.regional import blend_seed_preds, fit_predict_regional
 from src.oibc.timeaxis import k_weight, op_date, require_hourly_kst
@@ -582,7 +583,8 @@ def run_validation(
             raise RunnerError(f"registry: unknown baseline {cfg.baseline_run_id!r}")
         config_diff = _check_comparable(matches[0], cfg, panel_hash, val, comp)
     panel = _load_panel(panel_file, cfg, comp)
-    site_geo = _site_geo(panel) if cfg.model.regional.weight > 0 else None
+    families_active = cfg.model.families.cat_weight > 0 or cfg.model.families.mlp_weight > 0
+    site_geo = _site_geo(panel) if cfg.model.regional.weight > 0 or families_active else None
     features = feature_columns(panel, cfg.features)
     keep = list(dict.fromkeys(["site_id", "ts", "op_date", "energy", "capacity_kw", "smp", "k", *features]))
     train_panel = panel.loc[panel["period"] == "train", keep].reset_index(drop=True)
@@ -625,12 +627,32 @@ def run_validation(
         fit_sec = time.perf_counter() - t0
         preds = predict_seed_kwh(models, test_day, features, num_threads=cfg.model.n_jobs)
         del models
-        if site_geo is not None:
+        if cfg.model.regional.weight > 0:
+            assert site_geo is not None
             t1 = time.perf_counter()
             reg = fit_predict_regional(train_fold, test_day, features, site_geo, cfg.model)
             preds = blend_seed_preds(preds, reg, cfg.model.regional.weight)
             regional_sec = time.perf_counter() - t1
             del reg
+        if families_active:
+            assert site_geo is not None
+            t2 = time.perf_counter()
+            try:
+                cat = (
+                    fit_predict_catboost(train_fold, test_day, features, site_geo, cfg.model)
+                    if cfg.model.families.cat_weight > 0
+                    else None
+                )
+                mlp = (
+                    fit_predict_mlp(train_fold, test_day, features, site_geo, cfg.model)
+                    if cfg.model.families.mlp_weight > 0
+                    else None
+                )
+                preds = blend_families(preds, cat, mlp, cfg.model.families)
+            except FamilyError as exc:
+                raise RunnerError(str(exc)) from exc
+            family_sec = time.perf_counter() - t2
+            del cat, mlp
         night_mask = (night_all["op_date"] >= fold.test_start) & (night_all["op_date"] <= fold.test_end)
         night_fold = night_all.loc[night_mask].reset_index(drop=True)
         test_ts = pd.DatetimeIndex(test_day["ts"].unique()).union(
@@ -664,8 +686,10 @@ def run_validation(
                         "revenue_all": float(daily["revenue"].sum()),
                         "fit_sec": float(fit_sec),
                     }
-                    if site_geo is not None:
+                    if cfg.model.regional.weight > 0:
                         metrics[f"{fold.name}/{seed}"]["regional_sec"] = float(regional_sec)
+                    if families_active:
+                        metrics[f"{fold.name}/{seed}"]["family_sec"] = float(family_sec)
                 else:
                     metrics[f"{fold.name}/{seed}"]["W_warm"] = float(daily["penalty"].sum())
                 if subset == "warm":
@@ -826,7 +850,8 @@ def forecast_eval(
     comp = spec if spec is not None else CompetitionSpec()
     panel_file = panel_path if panel_path is not None else _default_panel_path()
     panel = _load_panel(panel_file, cfg, comp)
-    site_geo = _site_geo(panel) if cfg.model.regional.weight > 0 else None
+    families_active = cfg.model.families.cat_weight > 0 or cfg.model.families.mlp_weight > 0
+    site_geo = _site_geo(panel) if cfg.model.regional.weight > 0 or families_active else None
     features = feature_columns(panel, cfg.features)
     train_keep = list(dict.fromkeys([*features, "site_id", "ts", "energy", "capacity_kw", "smp", "k"]))
     eval_keep = list(dict.fromkeys([*features, "site_id", "ts", "capacity_kw"]))
@@ -866,12 +891,30 @@ def forecast_eval(
     models = fit_seed_models(train, features, cfg.model)
     preds = predict_seed_kwh(models, eval_day, features, num_threads=cfg.model.n_jobs)
     del models
-    if site_geo is not None:
+    if cfg.model.regional.weight > 0:
+        assert site_geo is not None
         preds = blend_seed_preds(
             preds,
             fit_predict_regional(train, eval_day, features, site_geo, cfg.model),
             cfg.model.regional.weight,
         )
+    if families_active:
+        assert site_geo is not None
+        try:
+            cat = (
+                fit_predict_catboost(train, eval_day, features, site_geo, cfg.model)
+                if cfg.model.families.cat_weight > 0
+                else None
+            )
+            mlp = (
+                fit_predict_mlp(train, eval_day, features, site_geo, cfg.model)
+                if cfg.model.families.mlp_weight > 0
+                else None
+            )
+            preds = blend_families(preds, cat, mlp, cfg.model.families)
+        except FamilyError as exc:
+            raise RunnerError(str(exc)) from exc
+        del cat, mlp
     mean = bag(preds)
     if mean.shape != (len(eval_day),) or not np.isfinite(mean).all() or (mean < 0).any():
         raise RunnerError("forecast: invalid seed-bag predictions")

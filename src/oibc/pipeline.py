@@ -15,6 +15,7 @@ from src.oibc.config import (
     CompetitionSpec,
     ComposeConfig,
     DataPaths,
+    FamilyConfig,
     FeatureConfig,
     ModelConfig,
     QualityConfig,
@@ -49,6 +50,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     val.add_argument("--allow-commit-drift", action="store_true")
     val.add_argument("--save-oof", action="store_true")
     val.add_argument("--regional-weight", type=float, default=0.0)
+    val.add_argument("--cat-weight", type=float, default=0.0)
+    val.add_argument("--mlp-weight", type=float, default=0.0)
     comp_cmd = sub.add_parser("compose")
     comp_cmd.add_argument("--comp-id", required=True)
     rn = sub.add_parser("report-netting")
@@ -88,7 +91,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 baseline_run_id=args.baseline,
                 composition_id=args.composition,
                 features=FeatureConfig(groups=frozenset(groups)),
-                model=ModelConfig(weight=args.weight, regional=RegionalConfig(weight=args.regional_weight)),
+                model=ModelConfig(weight=args.weight, regional=RegionalConfig(weight=args.regional_weight), families=FamilyConfig(cat_weight=args.cat_weight, mlp_weight=args.mlp_weight)),
                 allow_commit_drift=args.allow_commit_drift,
             ),
             save_oof=args.save_oof,

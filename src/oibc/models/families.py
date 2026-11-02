@@ -9,9 +9,11 @@ from collections.abc import Sequence
 
 import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
+from threadpoolctl import threadpool_limits
 
 from src.oibc.config import FamilyConfig, ModelConfig
 from src.oibc.models import regional as _regional
@@ -145,62 +147,84 @@ def _mlp_design(
     return train_scaled, test_scaled
 
 
+def _fit_mlp_member(
+    fam: FamilyConfig, seed: int, train: np.ndarray, target: np.ndarray, weight: np.ndarray, test: np.ndarray
+) -> np.ndarray:
+    # BLAS 스레드 수가 GEMM 분할을 바꿔 결과 비트가 달라지므로 1로 고정한다(작업자 수·기계 코어 수와 무관한 재현).
+    with threadpool_limits(limits=1, user_api="blas"):
+        model = MLPRegressor(
+            hidden_layer_sizes=tuple(int(h) for h in fam.mlp_hidden),
+            alpha=float(fam.mlp_alpha),
+            batch_size=int(fam.mlp_batch_size),
+            learning_rate_init=float(fam.mlp_learning_rate_init),
+            max_iter=int(fam.mlp_max_iter),
+            early_stopping=True,
+            validation_fraction=float(fam.mlp_validation_fraction),
+            n_iter_no_change=int(fam.mlp_n_iter_no_change),
+            random_state=int(seed),
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ConvergenceWarning)
+            model.fit(train, target, sample_weight=weight)
+        return np.asarray(model.predict(test), dtype="float64")
+
+
 def fit_predict_mlp(
     train: pd.DataFrame, test: pd.DataFrame, features: Sequence[str], site_geo: pd.DataFrame, model_cfg: ModelConfig
 ) -> np.ndarray:
-    """mlp_units x mlp_seeds 평균 지역 MLP 예측 (len(test),) 발전소 kWh(≥0, 유한)를 반환한다. 위반 시 FamilyError."""
+    """mlp_units x mlp_seeds 평균 지역 MLP 예측 (len(test),) 발전소 kWh(≥0, 유한)를 반환한다. 위반 시 FamilyError.
+
+    n_jobs > 1이면 구성원을 프로세스 풀에서 학습하며, 결과는 n_jobs와 무관하게 비트 단위로 같다.
+    """
     fam = model_cfg.families
     if not fam.mlp_units or not fam.mlp_seeds:
         raise FamilyError("mlp_units and mlp_seeds must not be empty")
-    total = np.zeros(len(test), dtype="float64")
+    t0 = time.perf_counter()
+    designs: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    test_cap = np.zeros(0, dtype="float64")
     for n_units, kmeans_seed in fam.mlp_units:
-        t0 = time.perf_counter()
         train_mat, test_mat, target, weight, test_code, test_cap, feat_cols = _common_panel(
             train, test, features, site_geo, model_cfg, int(n_units), int(kmeans_seed)
         )
-        train_scaled, test_scaled = _mlp_design(
-            train_mat, test_mat, feat_cols, model_cfg.families.mlp_clip_quantiles
-        )
+        train_scaled, test_scaled = _mlp_design(train_mat, test_mat, feat_cols, fam.mlp_clip_quantiles)
         train_scaled.flags.writeable = False
-        target_c = np.asarray(target, dtype="float64")
-        weight_c = np.asarray(weight, dtype="float64")
-
-        def _fit_one(
-            seed: int,
-            _train: np.ndarray = train_scaled,
-            _test: np.ndarray = test_scaled,
-            _target: np.ndarray = target_c,
-            _weight: np.ndarray = weight_c,
-        ) -> np.ndarray:
-            model = MLPRegressor(
-                hidden_layer_sizes=tuple(int(h) for h in fam.mlp_hidden),
-                alpha=float(fam.mlp_alpha),
-                batch_size=int(fam.mlp_batch_size),
-                learning_rate_init=float(fam.mlp_learning_rate_init),
-                max_iter=int(fam.mlp_max_iter),
-                early_stopping=True,
-                validation_fraction=float(fam.mlp_validation_fraction),
-                n_iter_no_change=int(fam.mlp_n_iter_no_change),
-                random_state=int(seed),
+        designs.append(
+            (
+                train_scaled,
+                test_scaled,
+                np.asarray(target, dtype="float64"),
+                np.asarray(weight, dtype="float64"),
+                test_code,
             )
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", ConvergenceWarning)
-                model.fit(_train, _target, sample_weight=_weight)
-            return np.asarray(model.predict(_test), dtype="float64")
-
-        # Python 3.11의 경고 필터는 스레드 간 공유되므로 지역 경고 억제를 순차 실행한다.
-        member_preds = [_fit_one(seed) for seed in fam.mlp_seeds]
-        for pred in member_preds:
-            with np.errstate(over="ignore", invalid="ignore"):
-                total += np.maximum(pred, 0.0)[test_code] * test_cap
+        )
         logger.info(
-            "[FCST] family=mlp n_units=%d kmeans_seed=%d train_rows=%d test_rows=%d sec=%.1f",
+            "[FCST] family=mlp n_units=%d kmeans_seed=%d train_rows=%d test_rows=%d",
             int(n_units),
             int(kmeans_seed),
             len(train_mat),
             len(test_mat),
-            time.perf_counter() - t0,
         )
+        del train_mat, test_mat
+    jobs = [(d, int(seed)) for d in range(len(designs)) for seed in fam.mlp_seeds]
+    # 큰 학습 행렬부터 배분해 마지막 대기열 꼬리를 줄인다. 합산은 아래에서 원래 순서로 한다.
+    order = sorted(range(len(jobs)), key=lambda j: -len(designs[jobs[j][0]][0]))
+    workers = min(int(model_cfg.n_jobs), len(jobs))
+    calls = [
+        (fam, jobs[j][1], designs[jobs[j][0]][0], designs[jobs[j][0]][2], designs[jobs[j][0]][3], designs[jobs[j][0]][1])
+        for j in order
+    ]
+    if workers <= 1:
+        results = [_fit_mlp_member(*call) for call in calls]
+    else:
+        results = Parallel(n_jobs=workers, backend="loky")(delayed(_fit_mlp_member)(*call) for call in calls)
+    preds = dict(zip(order, results, strict=True))
+    total = np.zeros(len(test), dtype="float64")
+    for j, (d, _seed) in enumerate(jobs):
+        with np.errstate(over="ignore", invalid="ignore"):
+            total += np.maximum(preds[j], 0.0)[designs[d][4]] * test_cap
+    logger.info(
+        "[FCST] family=mlp members=%d workers=%d sec=%.1f", len(jobs), workers, time.perf_counter() - t0
+    )
     out: np.ndarray = total / (len(fam.mlp_units) * len(fam.mlp_seeds))
     if not np.isfinite(out).all() or (out < 0).any():
         raise FamilyError("prediction must be finite and non-negative")

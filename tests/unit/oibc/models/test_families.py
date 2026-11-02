@@ -93,7 +93,7 @@ def test_mlp_warning_filters_restored_and_worker_counts_match() -> None:
         warnings.simplefilter("always")
         before = list(warnings.filters)
         serial = fit_predict_mlp(train, test, FEATURES, geo, _cfg(seed_workers=1))
-        parallel_cfg = fit_predict_mlp(train, test, FEATURES, geo, _cfg(seed_workers=2))
+        parallel_cfg = fit_predict_mlp(train, test, FEATURES, geo, _cfg(n_jobs=2))
         assert warnings.filters == before
     assert all(not issubclass(w.category, ConvergenceWarning) for w in captured)
     np.testing.assert_array_equal(serial, parallel_cfg)
@@ -217,7 +217,7 @@ def test_mlp_deterministic_across_calls() -> None:
     train = _frame(geo, seed=0)
     test = _frame(geo, seed=1, labeled=False)
     cfg = _cfg()
-    cfg = ModelConfig(**{**cfg.model_dump(), "seed_workers": 2})
+    cfg = ModelConfig(**{**cfg.model_dump(), "n_jobs": 2})
     assert np.array_equal(
         fit_predict_mlp(train, test, FEATURES, geo, cfg),
         fit_predict_mlp(train, test, FEATURES, geo, cfg),

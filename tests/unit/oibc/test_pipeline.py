@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import runpy
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -1031,3 +1032,70 @@ def test_splice_submission_rejects_identical_inputs_and_no_break(tmp_path: Path,
     monkeypatch.setattr(drift_mod, "detect_breaks", lambda fc, p, variables, end, cfg: dict.fromkeys(variables))
     with pytest.raises(RunnerError, match="no break"):
         splice_submission("base", "fb", "spliced")
+
+
+def _scale_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    import src.oibc.config as config_mod
+
+    root = tmp_path / "submissions"
+    root.mkdir()
+    paths = config_mod.ArtifactPaths(submissions=root)
+    monkeypatch.setattr(config_mod, "ArtifactPaths", lambda *a, **k: paths)
+    _write_sub(root, "base", "base-run", "a" * 64, 100.0, ["2026-01-22T12:00:00+09:00", "2026-01-23T01:00:00+09:00"])
+    return root
+
+
+def test_scale_submission_multiplies_every_value_and_records_note(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.submit.build as build_mod
+    from src.oibc.pipeline import scale_submission
+
+    _scale_env(tmp_path, monkeypatch)
+    calls: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: calls.append((a, k)))
+    scale_submission("base", 0.98, "scaled")
+    (assignment, forecast, sub_id), kwargs = calls[0]
+    assert sub_id == "scaled"
+    assert len(forecast) == 4
+    np.testing.assert_allclose(forecast["forecast_kwh"].to_numpy(), 98.0, rtol=0, atol=1e-12)
+    assert str(forecast["ts"].dt.tz) == "Asia/Seoul"
+    assert list(assignment.columns) == ["site_id", "group"]
+    assert kwargs["note"] == "level-scale base=base scale=0.98"
+    assert kwargs["run_id"] == "base-run"
+    assert kwargs["local_metrics"] == {"W_all": 1.0, "W_warm": 1.0}
+
+
+@pytest.mark.parametrize("scale", [0.0, -0.5, 2.5, float("nan"), float("inf")])
+def test_scale_submission_rejects_out_of_range_scale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scale: float) -> None:
+    from src.oibc.pipeline import scale_submission
+    from src.oibc.train.runner import RunnerError
+
+    _scale_env(tmp_path, monkeypatch)
+    with pytest.raises(RunnerError, match="scale must be finite"):
+        scale_submission("base", scale, "scaled")
+
+
+def test_scale_submission_keeps_base_note_and_rejects_missing_base(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+
+    import src.oibc.submit.build as build_mod
+    from src.oibc.pipeline import scale_submission
+    from src.oibc.train.runner import RunnerError
+
+    root = _scale_env(tmp_path, monkeypatch)
+    manifest_path = root / "base" / "manifest.json"
+    manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["note"] = "splice base=x fallback=y"
+    manifest_path.write_text(_json.dumps(manifest), encoding="utf-8")
+    calls: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: calls.append((a, k)))
+    scale_submission("base", 0.98, "scaled")
+    assert calls[0][1]["note"] == "level-scale base=base scale=0.98; base_note=splice base=x fallback=y"
+    with pytest.raises(RunnerError, match="scale: unreadable submission missing"):
+        scale_submission("missing", 0.98, "scaled")
+
+
+def test_scale_submission_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, float, str]] = []
+    monkeypatch.setattr("src.oibc.pipeline.scale_submission", lambda base, s, sid: calls.append((base, s, sid)))
+    assert main(["scale-submission", "--base-sub", "b", "--scale", "0.98", "--sub-id", "s"]) == 0
+    assert calls == [("b", 0.98, "s")]

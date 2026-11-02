@@ -9,12 +9,14 @@ import math
 import time
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Literal
 
 from src.oibc.config import (
     REFERENCE_COMP_ID,
     CompetitionSpec,
     ComposeConfig,
     DataPaths,
+    DriftConfig,
     FamilyConfig,
     FeatureConfig,
     ModelConfig,
@@ -52,6 +54,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     val.add_argument("--regional-weight", type=float, default=0.0)
     val.add_argument("--cat-weight", type=float, default=0.0)
     val.add_argument("--mlp-weight", type=float, default=0.0)
+    raw_vars = sorted((*FeatureConfig().wa_vars, *FeatureConfig().wb_vars))
+    val.add_argument("--drop-var", action="append", choices=raw_vars, default=[])
+    val.add_argument("--mlp-clip", nargs=2, type=float, metavar=("LO", "HI"), default=None)
     comp_cmd = sub.add_parser("compose")
     comp_cmd.add_argument("--comp-id", required=True)
     rn = sub.add_parser("report-netting")
@@ -63,6 +68,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub_cmd.add_argument("--run-id", required=True)
     sub_cmd.add_argument("--sub-id", required=True)
     sub_cmd.add_argument("--calibration", action="store_true")
+    sub_cmd.add_argument("--allow-break", action="append", choices=raw_vars, default=[])
+    splice = sub.add_parser("splice-submission")
+    splice.add_argument("--base-sub", required=True)
+    splice.add_argument("--fallback-sub", required=True)
+    splice.add_argument("--sub-id", required=True)
     rc = sub.add_parser("report-calibration")
     rc.add_argument("--run-id", required=True)
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -84,14 +94,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         from src.oibc.train.runner import run_validation
 
         groups = set(FeatureConfig().groups) - set(args.drop_group)
+        drop = set(args.drop_var)
+        defaults = FeatureConfig()
+        features = FeatureConfig(
+            groups=frozenset(groups),
+            wa_vars=tuple(v for v in defaults.wa_vars if v not in drop),
+            wb_vars=tuple(v for v in defaults.wb_vars if v not in drop),
+        )
+        clip = tuple(args.mlp_clip) if args.mlp_clip else None
         run_validation(
             RunConfig(
                 run_id=args.run_id,
                 hypothesis=args.hypothesis,
                 baseline_run_id=args.baseline,
                 composition_id=args.composition,
-                features=FeatureConfig(groups=frozenset(groups)),
-                model=ModelConfig(weight=args.weight, regional=RegionalConfig(weight=args.regional_weight), families=FamilyConfig(cat_weight=args.cat_weight, mlp_weight=args.mlp_weight)),
+                features=features,
+                model=ModelConfig(
+                    weight=args.weight,
+                    regional=RegionalConfig(weight=args.regional_weight),
+                    families=FamilyConfig(
+                        cat_weight=args.cat_weight,
+                        mlp_weight=args.mlp_weight,
+                        mlp_clip_quantiles=clip,
+                    ),
+                ),
                 allow_commit_drift=args.allow_commit_drift,
             ),
             save_oof=args.save_oof,
@@ -201,6 +227,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             cal = _CloudCalibration(a=cal_a, b=cal_b, at_boundary=False, n_fit_hours=cal_n)
             cal_record = {"a": cal_a, "b": cal_b}
             note = "calibration: production a,b from calibration.json"
+        breaks = _check_input_breaks(cfg, spec, set(args.allow_break))
+        if breaks:
+            note = "; ".join(part for part in (note, *breaks) if part)
         forecast = forecast_eval(cfg, panel_path=panel_path, spec=spec, calibration=cal, calibration_cfg=cal_cfg)
         _, final_sha = resolve_composition(
             cfg.composition_id, pd.read_parquet(DataPaths().canonical_dir / "sites.parquet"), spec=spec,
@@ -218,6 +247,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             calibration=cal_record,
             spec=spec,
         )
+    elif args.command == "splice-submission":
+        splice_submission(args.base_sub, args.fallback_sub, args.sub_id)
     elif args.command == "report-netting":
         import json
 
@@ -261,6 +292,128 @@ def main(argv: Sequence[str] | None = None) -> int:
     elapsed = time.perf_counter() - start
     logger.info("[SYS] pipeline %s done in %.1fs", args.command, elapsed)
     return exit_code
+
+
+_PROVIDERS: tuple[Literal["wa", "wb"], ...] = ("wa", "wb")
+
+
+def _check_input_breaks(cfg: RunConfig, spec: CompetitionSpec, allowed: set[str]) -> list[str]:
+    """사용 원천 변수의 단절을 탐지해 허용되지 않은 단절은 RunnerError, 허용된 단절은 note 항목으로 반환한다."""
+    import pandas as pd
+
+    from src.oibc.data.drift import detect_breaks, used_raw_variables
+    from src.oibc.train.runner import RunnerError
+
+    notes: list[str] = []
+    used = used_raw_variables(cfg.features)
+    for provider in _PROVIDERS:
+        variables = used[provider]
+        fc = pd.read_parquet(
+            DataPaths().canonical_dir / f"forecast_{provider}.parquet",
+            columns=[f"{provider}_station", "round", "ts", *variables],
+        )
+        found = detect_breaks(fc, provider, variables, spec.train_end, DriftConfig())
+        for var, first in found.items():
+            if first is None:
+                continue
+            day = first.strftime("%Y-%m-%d")
+            logger.info("[DATA] drift var=%s first_break=%s", var, day)
+            if var not in allowed:
+                raise RunnerError(f"submit: input break {var} from {day}")
+            notes.append(f"break:{var}:{day}")
+    return notes
+
+
+def splice_submission(base_sub: str, fallback_sub: str, sub_id: str) -> Path:
+    """단절 전은 base, 단절 후는 fallback 예측을 쓴 제출을 만든다. 계약 위반 시 RunnerError."""
+    import pandas as pd
+
+    from src.oibc.config import ArtifactPaths
+    from src.oibc.data.drift import detect_breaks, splice_forecasts, used_raw_variables
+    from src.oibc.evaluate.registry import read_records
+    from src.oibc.submit.build import SubmissionManifest, write_submission
+    from src.oibc.timeaxis import op_date
+    from src.oibc.train.runner import RunnerError
+
+    root = ArtifactPaths().submissions
+
+    def _read(name: str) -> tuple[SubmissionManifest, pd.DataFrame, pd.DataFrame]:
+        sub_dir = root / name
+        try:
+            manifest = SubmissionManifest.model_validate_json((sub_dir / "manifest.json").read_text(encoding="utf-8"))
+            comp = pd.read_csv(sub_dir / "composition.csv", dtype=str)
+            fc = pd.read_csv(sub_dir / "forecast.csv", dtype={"group": str})
+            fc["ts"] = pd.to_datetime(fc["ts"], format="ISO8601").dt.tz_convert("Asia/Seoul")
+        except (OSError, KeyError, ValueError, TypeError) as exc:
+            raise RunnerError(f"splice: unreadable submission {name} ({exc})") from exc
+        return manifest, comp, fc
+
+    base_m, base_comp, base_fc = _read(base_sub)
+    fb_m, _, fb_fc = _read(fallback_sub)
+    if base_m.composition_sha256 != fb_m.composition_sha256:
+        raise RunnerError("splice: composition hash mismatch")
+    if base_m.calibration is not None or fb_m.calibration is not None:
+        raise RunnerError("splice: calibrated submissions are not spliced")
+    records = read_records()
+    configs: dict[str, RunConfig] = {}
+    specs: dict[str, CompetitionSpec] = {}
+    for label, manifest in (("base", base_m), ("fallback", fb_m)):
+        match = next((r for r in records if r.run_id == manifest.run_id), None)
+        if match is None:
+            raise RunnerError(f"splice: unknown run_id for {label}")
+        try:
+            configs[label] = RunConfig.model_validate(match.config)
+            spec_data = dict(match.config["competition"])
+            for key in ("train_end", "eval_start", "eval_end"):
+                spec_data[key] = pd.Timestamp(spec_data[key]).tz_convert("Asia/Seoul")
+            specs[label] = CompetitionSpec.model_validate(spec_data)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RunnerError(f"splice: invalid recorded config for {label} ({exc})") from exc
+    if specs["base"].train_end != specs["fallback"].train_end:
+        raise RunnerError("splice: train_end mismatch")
+    spec = specs["fallback"]
+
+    base_used = used_raw_variables(configs["base"].features)
+    fb_used = used_raw_variables(configs["fallback"].features)
+    diff = [(p, v) for p in base_used for v in base_used[p] if v not in fb_used[p]]
+    if not diff:
+        raise RunnerError("splice: base and fallback use the same raw variables")
+
+    switches: list[pd.Timestamp] = []
+    for provider in _PROVIDERS:
+        needed = tuple(dict.fromkeys((*base_used[provider], *fb_used[provider])))
+        canon = pd.read_parquet(
+            DataPaths().canonical_dir / f"forecast_{provider}.parquet",
+            columns=[f"{provider}_station", "round", "ts", *needed],
+        )
+        found = detect_breaks(canon, provider, needed, spec.train_end, DriftConfig())
+        for var in fb_used[provider]:
+            first = found.get(var)
+            if first is not None:
+                raise RunnerError(f"splice: fallback input break {var} from {first.strftime('%Y-%m-%d')}")
+        switches.extend(found[v] for p, v in diff if p == provider and found.get(v) is not None)
+    if not switches:
+        raise RunnerError("splice: no break in base-only variables")
+    switch = min(switches)
+    spliced = splice_forecasts(base_fc, fb_fc, switch)
+    from_fallback = int((op_date(spliced["ts"]) >= switch).sum())
+    switch_day = switch.strftime("%Y-%m-%d")
+    diff_names = ",".join(v for _, v in diff)
+    note = f"splice base={base_sub} fallback={fallback_sub} switch={switch_day} vars={diff_names}"
+    logger.info(
+        "[SUBMIT] splice base=%s fallback=%s switch=%s rows_from_fallback=%d",
+        base_sub, fallback_sub, switch_day, from_fallback,
+    )
+    return write_submission(
+        base_comp,
+        spliced,
+        sub_id,
+        run_id=fb_m.run_id,
+        composition_id=fb_m.composition_id,
+        local_metrics=fb_m.local_metrics,
+        note=note,
+        spec=spec,
+    )
 
 
 if __name__ == "__main__":

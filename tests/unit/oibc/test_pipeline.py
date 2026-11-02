@@ -1,4 +1,5 @@
 import logging
+from types import SimpleNamespace
 import runpy
 from pathlib import Path
 
@@ -97,6 +98,7 @@ def test_submit_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
         assert kwargs["panel_path"] == panel_path
         return pd.DataFrame({"group": ["G1"], "ts": [pd.Timestamp("2025-06-01 01:00", tz="Asia/Seoul")], "forecast_kwh": [1.0]})
 
+    monkeypatch.setattr("src.oibc.pipeline._check_input_breaks", lambda *a, **k: [])
     monkeypatch.setattr(runner_mod, "forecast_eval", predict)
     calls: list[tuple[object, ...]] = []
     monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: calls.append((a, k)))
@@ -402,6 +404,7 @@ def test_pipeline_submit_rejects_composition_hash_drift(
         replace_composition()
         return pd.DataFrame()
 
+    monkeypatch.setattr("src.oibc.pipeline._check_input_breaks", lambda *a, **k: [])
     monkeypatch.setattr(runner_mod, "forecast_eval", predict)
     monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: pytest.fail("drift 이전에 실패해야 함"))
     with pytest.raises(runner_mod.RunnerError, match="composition"):
@@ -433,6 +436,7 @@ def test_pipeline_submit_legacy_reference_record_allowed(tmp_path: Path, monkeyp
         metrics={}, comparison={"bag": {"A": {"W_all": 1.0, "W_warm": 0.5}}},
     )
     monkeypatch.setattr(registry_mod, "read_records", lambda *a, **k: [rec])
+    monkeypatch.setattr("src.oibc.pipeline._check_input_breaks", lambda *a, **k: [])
     monkeypatch.setattr(runner_mod, "forecast_eval", lambda *a, **k: pd.DataFrame({"ok": [1]}))
     monkeypatch.setattr(
         pd, "read_parquet",
@@ -665,6 +669,7 @@ def test_submit_calibration_passes_production_params(tmp_path: Path, monkeypatch
         seen.update(kwargs)
         return pd.DataFrame({"group": ["G1"], "ts": [pd.Timestamp("2025-06-01 01:00", tz="Asia/Seoul")], "forecast_kwh": [1.0]})
 
+    monkeypatch.setattr("src.oibc.pipeline._check_input_breaks", lambda *a, **k: [])
     monkeypatch.setattr(runner_mod, "forecast_eval", predict)
     writes: list[tuple[object, ...]] = []
     monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: writes.append((a, k)))
@@ -685,6 +690,7 @@ def test_submit_without_flag_unchanged(tmp_path: Path, monkeypatch: pytest.Monke
         seen.update(kwargs)
         return pd.DataFrame({"group": ["G1"], "ts": [pd.Timestamp("2025-06-01 01:00", tz="Asia/Seoul")], "forecast_kwh": [1.0]})
 
+    monkeypatch.setattr("src.oibc.pipeline._check_input_breaks", lambda *a, **k: [])
     monkeypatch.setattr(runner_mod, "forecast_eval", predict)
     monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: None)
     assert main(["submit", "--run-id", "r1", "--sub-id", "s1"]) == 0
@@ -754,3 +760,274 @@ def test_validate_run_rejects_family_weight_sum(monkeypatch: pytest.MonkeyPatch)
     with pytest.raises(ValidationError):
         main(["validate-run", "--run-id", "r1", "--hypothesis", "h", "--cat-weight", "0.6", "--mlp-weight", "0.5"])
     assert calls == []
+
+
+def test_validate_run_drop_var_and_clip_reach_run_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.config import FeatureConfig
+
+    calls: list[object] = []
+    monkeypatch.setattr(runner_mod, "run_validation", lambda cfg, **k: calls.append(cfg))
+    argv = ["validate-run", "--run-id", "r1", "--hypothesis", "h", "--drop-var", "wa_ground_press", "--mlp-clip", "0.001", "0.999"]
+    assert main(argv) == 0
+    cfg = calls[0]
+    default = FeatureConfig()
+    assert "wa_ground_press" not in cfg.features.wa_vars
+    assert cfg.features.wa_vars == tuple(v for v in default.wa_vars if v != "wa_ground_press")
+    assert cfg.features.wb_vars == default.wb_vars
+    assert cfg.model.families.mlp_clip_quantiles == (0.001, 0.999)
+
+
+def test_validate_run_rejects_unknown_drop_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(runner_mod, "run_validation", lambda cfg, **k: calls.append(cfg))
+    with pytest.raises(SystemExit):
+        main(["validate-run", "--run-id", "r1", "--hypothesis", "h", "--drop-var", "not_a_var"])
+    assert calls == []
+
+
+def test_validate_run_defaults_keep_features_and_clip_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.config import FeatureConfig
+
+    calls: list[object] = []
+    monkeypatch.setattr(runner_mod, "run_validation", lambda cfg, **k: calls.append(cfg))
+    assert main(["validate-run", "--run-id", "r1", "--hypothesis", "h"]) == 0
+    assert calls[0].features == FeatureConfig(groups=frozenset(FeatureConfig().groups))
+    assert calls[0].model.families.mlp_clip_quantiles is None
+
+
+def test_submit_aborts_on_unallowed_break(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.data.drift as drift_mod
+    from src.oibc.config import CompetitionSpec, FeatureConfig, RunConfig
+    from src.oibc.pipeline import _check_input_breaks
+    from src.oibc.train.runner import RunnerError
+
+    cfg = RunConfig(run_id="r1", hypothesis="h", features=FeatureConfig())
+    spec = CompetitionSpec()
+    breaks = {"wa_ground_press": pd.Timestamp("2026-01-23", tz="Asia/Seoul")}
+    monkeypatch.setattr(pd, "read_parquet", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(drift_mod, "detect_breaks", lambda fc, p, variables, end, c: {v: breaks.get(v) for v in variables})
+    with pytest.raises(RunnerError, match="input break wa_ground_press from 2026-01-23"):
+        _check_input_breaks(cfg, spec, set())
+    notes = _check_input_breaks(cfg, spec, {"wa_ground_press"})
+    assert notes == ["break:wa_ground_press:2026-01-23"]
+
+
+def _write_sub(root: Path, name: str, run_id: str, comp_sha: str, groups_value: float, ts_list: list[str]) -> None:
+    import json as _json
+
+    sub = root / name
+    sub.mkdir(parents=True)
+    (sub / "composition.csv").write_text("site_id,group\ns1,G1\ns2,G2\n", encoding="utf-8")
+    rows = ["group,ts,forecast_kwh"]
+    rows.extend(f"{g},{t},{groups_value}" for g in ("G1", "G2") for t in ts_list)
+    (sub / "forecast.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    manifest = {
+        "sub_id": name,
+        "created_at": "2026-11-02T10:00:00+09:00",
+        "run_id": run_id,
+        "composition_id": "geo64-s0",
+        "git_commit": None,
+        "composition_sha256": comp_sha,
+        "forecast_sha256": "0" * 64,
+        "group_capacity_kw": {"G1": 20000.0, "G2": 20000.0},
+        "group_forecast_total_kwh": {"G1": 1.0, "G2": 1.0},
+        "local_metrics": {"W_all": 1.0, "W_warm": 1.0},
+        "warnings": [],
+    }
+    (sub / "manifest.json").write_text(_json.dumps(manifest), encoding="utf-8")
+
+
+def _splice_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base_sha: str, fb_sha: str):
+    import src.oibc.config as config_mod
+    from src.oibc.config import CompetitionSpec, FeatureConfig, RunConfig
+
+    root = tmp_path / "submissions"
+    root.mkdir()
+    paths = config_mod.ArtifactPaths(submissions=root)
+    monkeypatch.setattr(config_mod, "ArtifactPaths", lambda *a, **k: paths)
+    default = FeatureConfig()
+    base_features = default
+    fb_features = FeatureConfig(wa_vars=tuple(v for v in default.wa_vars if v != "wa_ground_press"))
+    spec_cfg = CompetitionSpec().model_dump(mode="json")
+    records = []
+    for run_id, feats in (("base-run", base_features), ("fb-run", fb_features)):
+        cfg = RunConfig(run_id=run_id, hypothesis="h", features=feats).model_dump(mode="json")
+        cfg["competition"] = spec_cfg
+        records.append(SimpleNamespace(run_id=run_id, config=cfg))
+    import src.oibc.evaluate.registry as registry_mod
+
+    monkeypatch.setattr(registry_mod, "read_records", lambda *a, **k: records)
+    ts = ["2026-01-22T12:00:00+09:00", "2026-01-23T01:00:00+09:00"]
+    _write_sub(root, "base", "base-run", base_sha, 1.0, ts)
+    _write_sub(root, "fb", "fb-run", fb_sha, 2.0, ts)
+    return root
+
+
+def test_splice_submission_rejects_composition_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.pipeline import splice_submission
+    from src.oibc.train.runner import RunnerError
+
+    _splice_env(tmp_path, monkeypatch, base_sha="a" * 64, fb_sha="b" * 64)
+    with pytest.raises(RunnerError, match="composition hash"):
+        splice_submission("base", "fb", "spliced")
+
+
+def test_splice_submission_rejects_fallback_with_break(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.data.drift as drift_mod
+    from src.oibc.pipeline import splice_submission
+    from src.oibc.train.runner import RunnerError
+
+    _splice_env(tmp_path, monkeypatch, base_sha="a" * 64, fb_sha="a" * 64)
+    monkeypatch.setattr(pd, "read_parquet", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(
+        drift_mod,
+        "detect_breaks",
+        lambda fc, p, variables, end, cfg: {v: pd.Timestamp("2026-01-23", tz="Asia/Seoul") for v in variables},
+    )
+    with pytest.raises(RunnerError, match="fallback input break"):
+        splice_submission("base", "fb", "spliced")
+
+
+def test_splice_submission_switches_at_first_break(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.data.drift as drift_mod
+    import src.oibc.submit.build as build_mod
+    from src.oibc.pipeline import splice_submission
+
+    _splice_env(tmp_path, monkeypatch, base_sha="a" * 64, fb_sha="a" * 64)
+    monkeypatch.setattr(pd, "read_parquet", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(
+        drift_mod,
+        "detect_breaks",
+        lambda fc, p, variables, end, cfg: {
+            v: (pd.Timestamp("2026-01-23", tz="Asia/Seoul") if v == "wa_ground_press" else None) for v in variables
+        },
+    )
+    calls: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: calls.append((a, k)))
+    splice_submission("base", "fb", "spliced")
+    (assignment, forecast, sub_id), kwargs = calls[0]
+    assert sub_id == "spliced"
+    assert kwargs["note"].startswith("splice base=base fallback=fb switch=2026-01-23 vars=wa_ground_press")
+    assert kwargs["run_id"] == "fb-run"
+    keys = zip(forecast["group"], forecast["ts"].dt.strftime("%Y-%m-%d %H"), strict=True)
+    values = dict(zip(keys, forecast["forecast_kwh"], strict=True))
+    assert values[("G1", "2026-01-22 12")] == 1.0
+    assert values[("G1", "2026-01-23 01")] == 2.0
+
+
+def test_submit_records_allowed_break_in_note(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import hashlib
+    from datetime import UTC, datetime
+
+    from src.oibc.config import FeatureConfig, ModelConfig, RunConfig
+    from src.oibc.evaluate import registry as registry_mod
+    from src.oibc.evaluate.registry import ExperimentRecord
+    from src.oibc.submit import build as build_mod
+
+    panel_path = tmp_path / "panel.parquet"
+    panel_path.write_bytes(b"validated panel")
+    cfg = RunConfig(run_id="r1", hypothesis="h", features=FeatureConfig(groups=frozenset()), model=ModelConfig(seeds=(0,), weight="none"))
+    config = cfg.model_dump(mode="json") | {
+        "panel_path": str(panel_path), "panel_sha256": hashlib.sha256(panel_path.read_bytes()).hexdigest(),
+        "composition_sha256": "abc", "competition": CompetitionSpec().model_dump(mode="json"),
+    }
+    rec = ExperimentRecord(
+        run_id="r1", created_at=datetime(2026, 1, 1, tzinfo=UTC), hypothesis="h", config=config, git_commit=None,
+        seeds=(0,), folds=("A",), metrics={"A/0": {"W": 1.0}}, comparison={"bag": {"A": {"W_all": 5.0, "W_warm": 2.0}}},
+    )
+    monkeypatch.setattr(registry_mod, "read_records", lambda *a, **k: [rec])
+    monkeypatch.setattr(
+        runner_mod, "resolve_composition",
+        lambda *a, **k: (pd.DataFrame({"site_id": ["s"], "group": ["G1"]}), "abc"),
+    )
+    monkeypatch.setattr(
+        "src.oibc.pipeline._check_input_breaks",
+        lambda *a, **k: ["break:wa_ground_press:2026-01-23"],
+    )
+    monkeypatch.setattr(
+        runner_mod, "forecast_eval",
+        lambda *a, **k: pd.DataFrame({"group": ["G1"], "ts": [pd.Timestamp("2025-06-01 01:00", tz="Asia/Seoul")], "forecast_kwh": [1.0]}),
+    )
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: calls.append((a, k)))
+    assert main(["submit", "--run-id", "r1", "--sub-id", "s1"]) == 0
+    assert calls[0][1]["note"] == "break:wa_ground_press:2026-01-23"
+
+
+def test_splice_submission_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        "src.oibc.pipeline.splice_submission", lambda base, fb, sid: calls.append((base, fb, sid))
+    )
+    assert main(["splice-submission", "--base-sub", "b", "--fallback-sub", "f", "--sub-id", "s"]) == 0
+    assert calls == [("b", "f", "s")]
+
+
+def test_splice_env_rejects_unreadable_and_unknown_and_calibrated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+
+    import src.oibc.evaluate.registry as registry_mod
+    from src.oibc.pipeline import splice_submission
+    from src.oibc.train.runner import RunnerError
+
+    root = _splice_env(tmp_path, monkeypatch, base_sha="a" * 64, fb_sha="a" * 64)
+    with pytest.raises(RunnerError, match="unreadable"):
+        splice_submission("missing", "fb", "spliced")
+    monkeypatch.setattr(registry_mod, "read_records", lambda *a, **k: [])
+    with pytest.raises(RunnerError, match="unknown run_id"):
+        splice_submission("base", "fb", "spliced")
+    monkeypatch.undo()
+    (tmp_path / "again").mkdir()
+    root = _splice_env(tmp_path / "again", monkeypatch, base_sha="a" * 64, fb_sha="a" * 64)
+    manifest_path = root / "fb" / "manifest.json"
+    data = _json.loads(manifest_path.read_text(encoding="utf-8"))
+    data["calibration"] = {"a": 1.0, "b": 0.0}
+    manifest_path.write_text(_json.dumps(data), encoding="utf-8")
+    with pytest.raises(RunnerError, match="calibrated"):
+        splice_submission("base", "fb", "spliced")
+
+
+def test_splice_submission_rejects_invalid_config_and_train_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.evaluate.registry as registry_mod
+    from src.oibc.pipeline import splice_submission
+    from src.oibc.train.runner import RunnerError
+
+    _splice_env(tmp_path, monkeypatch, base_sha="a" * 64, fb_sha="a" * 64)
+    records = registry_mod.read_records()
+    bad = SimpleNamespace(run_id="fb-run", config={"no": "run"})
+    monkeypatch.setattr(registry_mod, "read_records", lambda *a, **k: [records[0], bad])
+    with pytest.raises(RunnerError, match="invalid recorded config"):
+        splice_submission("base", "fb", "spliced")
+
+    shifted = dict(records[1].config)
+    comp = dict(shifted["competition"])
+    for key in ("train_end", "eval_start", "eval_end"):
+        comp[key] = (pd.Timestamp(comp[key]) + pd.Timedelta(days=1)).isoformat()
+    shifted["competition"] = comp
+    monkeypatch.setattr(
+        registry_mod, "read_records",
+        lambda *a, **k: [records[0], SimpleNamespace(run_id="fb-run", config=shifted)],
+    )
+    with pytest.raises(RunnerError, match="train_end mismatch"):
+        splice_submission("base", "fb", "spliced")
+
+
+def test_splice_submission_rejects_identical_inputs_and_no_break(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.data.drift as drift_mod
+    import src.oibc.evaluate.registry as registry_mod
+    from src.oibc.pipeline import splice_submission
+    from src.oibc.train.runner import RunnerError
+
+    _splice_env(tmp_path, monkeypatch, base_sha="a" * 64, fb_sha="a" * 64)
+    records = registry_mod.read_records()
+    fb_config = records[1].config
+    same_features = [SimpleNamespace(run_id="base-run", config=fb_config), SimpleNamespace(run_id="fb-run", config=fb_config)]
+    monkeypatch.setattr(registry_mod, "read_records", lambda *a, **k: same_features)
+    with pytest.raises(RunnerError, match="same raw variables"):
+        splice_submission("base", "fb", "spliced")
+
+    monkeypatch.setattr(registry_mod, "read_records", lambda *a, **k: records)
+    monkeypatch.setattr(pd, "read_parquet", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(drift_mod, "detect_breaks", lambda fc, p, variables, end, cfg: dict.fromkeys(variables))
+    with pytest.raises(RunnerError, match="no break"):
+        splice_submission("base", "fb", "spliced")

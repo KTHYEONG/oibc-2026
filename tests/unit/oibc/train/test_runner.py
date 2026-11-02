@@ -1443,6 +1443,7 @@ def test_pipeline_submission_composition_roundtrip(
     data = runner_mod.DataPaths().model_copy(update={"raw_dir": raw})
     monkeypatch.setattr(pipeline, "DataPaths", lambda: data)
     monkeypatch.setattr(validate, "DataPaths", lambda: data)
+    monkeypatch.setattr(pipeline, "_check_input_breaks", lambda *a, **k: [])
     for module in (registry, store, build):
         monkeypatch.setattr(module, "ArtifactPaths", lambda: paths)
     assert pipeline.main(["submit", "--run-id", cfg.run_id, "--sub-id", "s1"]) == 0

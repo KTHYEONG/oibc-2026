@@ -580,3 +580,46 @@ def test_family_hyperparameter_bounds_rejected(kwargs: dict) -> None:
 
     with pytest.raises(ValueError, match=r"must"):
         FamilyConfig(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("clip", [(0.9, 0.1), (-0.1, 0.5), (0.2, float("nan")), (0.5, 0.5)])
+def test_family_config_rejects_bad_clip_quantiles(clip: tuple[float, float]) -> None:
+    from src.oibc.config import FamilyConfig
+
+    with pytest.raises(ValueError, match="mlp_clip_quantiles"):
+        FamilyConfig(mlp_clip_quantiles=clip)
+
+
+def test_family_config_clip_default_none() -> None:
+    from src.oibc.config import FamilyConfig
+
+    assert FamilyConfig().mlp_clip_quantiles is None
+    assert FamilyConfig(mlp_clip_quantiles=(0.001, 0.999)).mlp_clip_quantiles == (0.001, 0.999)
+
+
+@pytest.mark.parametrize("required", ["wa_cloud", "wb_cloud", "wb_uv_idx"])
+def test_feature_config_rejects_dropping_required_var(required: str) -> None:
+    from src.oibc.config import FeatureConfig
+
+    default = FeatureConfig()
+    with pytest.raises(ValueError, match="clear-sky"):
+        FeatureConfig(
+            wa_vars=tuple(v for v in default.wa_vars if v != required),
+            wb_vars=tuple(v for v in default.wb_vars if v != required),
+        )
+
+
+def test_drift_config_rejects_invalid_values() -> None:
+    from src.oibc.config import DriftConfig
+
+    assert DriftConfig().range_share == 0.01
+    for kwargs in ({"range_share": 0.0}, {"range_share": 1.0}, {"range_margin_frac": -0.1}, {"dispersion_factor": 1.0}):
+        with pytest.raises(ValueError, match=r"range_|dispersion_"):
+            DriftConfig(**kwargs)
+
+
+def test_drift_config_rejects_non_finite() -> None:
+    from src.oibc.config import DriftConfig
+
+    with pytest.raises(ValueError, match="must be finite"):
+        DriftConfig(dispersion_factor=float("inf"))

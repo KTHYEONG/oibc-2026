@@ -4,16 +4,17 @@
 
 ## 1. Objective & Settlement Fidelity
 - **Settlement Is the Metric:** Evaluate every forecasting and composition decision by `S` and `W`. MAE/RMSE are diagnostics only.
-- **Verified Formula:** `S = Σ_t SMP(t)·A(t) − 0.10·Σ_t SMP(t)·k(t)·|F(t) − A(t)|`, where `A` is group actual generation (kWh), `F` the group forecast, `k(t)=3` if the `ts` hour ∈ {11..15} else 1 (as labeled in `smp.csv`). Revenue is a constant under fixed assignment given `A`, so forecasting reduces to minimizing the `SMP·k`-weighted absolute error of the *group sum*; the optimal point forecast is the median of the group-sum distribution (symmetric L1), not the mean. Tie-breaks and the canonical submission contract remain `UNVERIFIED` until the problem definition is available.
+- **Verified Formula:** `S = Σ_t SMP(t)·A(t) − 0.10·Σ_t SMP(t)·k(t)·|F(t) − A(t)|`, where `A` is group actual generation (kWh), `F` the group forecast, `k(t)=3` if the `ts` hour ∈ {11..15} else 1 (as labeled in `smp.csv`). Revenue is a constant under fixed assignment given `A`, so forecasting reduces to minimizing the `SMP·k`-weighted absolute error of the *group sum*; the optimal point forecast is the median of the group-sum distribution (symmetric L1), not the mean. Ties go to the smaller unweighted absolute-error sum, then the earlier submission time (organizer Q&A notice).
 - **Group-Level Netting:** The penalty is computed per group then summed. Over/under-forecast errors cancel only among plants *within* a group, never across groups; this is the sole lever of composition optimization.
 - **Night & Zero Hours:** Zero-generation hours are still settled; any nonzero forecast there is penalized. Force exact zeros when generation is physically zero and keep forecasts ≥ 0.
 - **Weights Matter:** Errors at SMP=0 hours cost nothing; errors in 11–15h weigh 3×. Evaluate and train with the same weights.
 - **No Magic Numbers:** Competition constants (20,000 kW group minimum, 17:00 cutoff, 253 plants, 0.10 penalty rate, k hours/values) live in typed `Spec`/`Config` contracts with a source reference, never as literals in business logic.
 
 ## 2. Temporal Causality & Information Set
-- **Cutoff Rule:** A prediction for target date `D` may use only data available by 17:00 KST on `D-1`, including the 10:00 and 17:00 forecast issuance rounds of `D-1`.
-- **Right-Closed Hours:** Timestamp `HH:00` denotes the interval ending at `HH:00`. Misaligning by one hour between generation, SMP, and weather is a fatal defect; verify alignment explicitly.
-- **Forbidden Inputs:** Observed weather and actual generation from the evaluation period, and any information issued after the cutoff.
+- **Cutoff Rule:** A prediction for target date `D` may use only data published by 17:00 KST on `D-1`, including the 10:00 and 17:00 forecast issuance rounds of `D-1`. Pre-cutoff forecasts pointing past `D` are allowed. External sources follow the same rule: use the issuance/publication time, never the valid time, to decide availability.
+- **Right-Closed Hours:** Timestamp `HH:00` denotes the interval ending at `HH:00`. Misaligning by one hour between generation, SMP, and weather is a fatal defect; verify alignment explicitly. External data in UTC or left-labeled/instantaneous conventions must be converted explicitly.
+- **Forbidden Inputs:** Observed weather and actual generation from the evaluation period (any plant, competition or not), the target day's actual SMP, the last 7 training hours as inputs for 2025-06-01, any information issued after the cutoff, and statistics of the whole evaluation period (normalization, grouping, imputation fits).
+- **External Sources:** Only freely public, commercial-use, re-downloadable sources; record origin, license, and retrieval procedure in `docs/` and fetch them via scripted entry points. External weather may enter only as wide-area summaries without plant coordinates, identical for all plants; never per-plant grid/station selection or nearest-point matching.
 - **Perturbation Invariance:** Corrupting data after the cutoff must leave predictions for date `D` unchanged.
 
 ## 3. Validation & Leakage Control

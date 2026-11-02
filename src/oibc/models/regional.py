@@ -6,7 +6,7 @@ import logging
 import math
 import time
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import lightgbm as lgb
 import numpy as np
@@ -197,6 +197,29 @@ def _panel_targets(
     return target, np.maximum(raw, cfg.min_weight).astype("float64")
 
 
+def _fit_predict_member(
+    cfg: RegionalConfig, seed: int, train: np.ndarray, target: np.ndarray, weight: np.ndarray, test: np.ndarray
+) -> np.ndarray:
+    params: dict[str, object] = {
+        "objective": "l1",
+        "learning_rate": cfg.learning_rate,
+        "num_leaves": cfg.num_leaves,
+        "min_child_samples": cfg.min_child_samples,
+        "subsample": cfg.subsample,
+        "subsample_freq": cfg.subsample_freq,
+        "colsample_bytree": cfg.colsample_bytree,
+        "reg_lambda": cfg.reg_lambda,
+        # 자동 col/row-wise 선택은 실행 시간 측정으로 정해져 프로세스마다 결과가 달라진다.
+        "force_col_wise": True,
+        "num_threads": 1,
+        "seed": seed,
+        "verbose": -1,
+    }
+    dataset = lgb.Dataset(train, label=target, weight=weight, free_raw_data=False)
+    model = lgb.train(params, dataset, num_boost_round=cfg.n_rounds)
+    return np.asarray(model.predict(test, num_threads=1), dtype="float64")
+
+
 def fit_predict_regional(
     train: pd.DataFrame,
     test: pd.DataFrame,
@@ -223,62 +246,48 @@ def fit_predict_regional(
     if not np.isfinite(test_cap).all() or (test_cap <= 0).any():
         raise RegionalError("capacity_kw must be finite and positive")
     seeds = list(model_cfg.seeds)
-    workers = min(model_cfg.seed_workers, len(seeds), model_cfg.n_jobs)
-    threads = max(1, model_cfg.n_jobs // workers)
+    workers = max(1, int(model_cfg.n_jobs))
+    t0 = time.perf_counter()
     total = np.zeros((len(seeds), len(test)), dtype="float64")
-    for n_units, kmeans_seed in cfg.units:
-        t0 = time.perf_counter()
-        member_units = site_units(site_geo, n_units, kmeans_seed, cfg)
-        centroids = unit_centroids(site_geo, member_units)
-        unit_of = {k: int(v) for k, v in member_units.items()}
-        train_mat, _, train_code, train_cap, _ = _panel_matrix(train, mean_cols, cfg.sd_vars, unit_of, centroids)
-        test_mat, _, test_code, _, _ = _panel_matrix(test, mean_cols, cfg.sd_vars, unit_of, centroids)
-        target, weight = _panel_targets(train, train_code, len(train_mat), train_cap, model_cfg)
-        train_mat.flags.writeable = False
-        target.flags.writeable = False
-        weight.flags.writeable = False
-
-        def _fit_one(
-            seed: int,
-            _mat: np.ndarray = train_mat,
-            _target: np.ndarray = target,
-            _weight: np.ndarray = weight,
-        ) -> lgb.Booster:
-            params: dict[str, object] = {
-                "objective": "l1",
-                "learning_rate": cfg.learning_rate,
-                "num_leaves": cfg.num_leaves,
-                "min_child_samples": cfg.min_child_samples,
-                "subsample": cfg.subsample,
-                "subsample_freq": cfg.subsample_freq,
-                "colsample_bytree": cfg.colsample_bytree,
-                "reg_lambda": cfg.reg_lambda,
-                # 자동 col/row-wise 선택은 실행 시간 측정으로 정해져 프로세스마다 결과가 달라진다.
-                "force_col_wise": True,
-                "num_threads": threads,
-                "seed": seed,
-                "verbose": -1,
-            }
-            dataset = lgb.Dataset(_mat, label=_target, weight=_weight, free_raw_data=False)
-            return lgb.train(params, dataset, num_boost_round=cfg.n_rounds)
-
-        if workers <= 1:
-            models = [_fit_one(seed) for seed in seeds]
-        else:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                models = list(pool.map(_fit_one, seeds))
-        for i, model in enumerate(models):
-            pred = np.asarray(model.predict(test_mat), dtype="float64")
-            with np.errstate(over="ignore", invalid="ignore"):
-                total[i] += np.maximum(pred, 0.0)[test_code] * test_cap
-        logger.info(
-            "[FCST] regional n_units=%d kmeans_seed=%d train_rows=%d test_rows=%d sec=%.1f",
-            n_units,
-            kmeans_seed,
-            len(train_mat),
-            len(test_mat),
-            time.perf_counter() - t0,
-        )
+    # 구성원 학습은 1스레드씩 단일 풀에서 돌린다. force_col_wise에서는 열 단위 분할이라 스레드 수가 결과를 바꾸지 않고,
+    # 단위 설정 사이 동기화 대기 없이 다음 행렬 생성과 학습이 겹친다.
+    futures: list[list[Future[np.ndarray]]] = []
+    test_codes: list[np.ndarray] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for n_units, kmeans_seed in cfg.units:
+            member_units = site_units(site_geo, n_units, kmeans_seed, cfg)
+            centroids = unit_centroids(site_geo, member_units)
+            unit_of = {k: int(v) for k, v in member_units.items()}
+            train_mat, _, train_code, train_cap, _ = _panel_matrix(train, mean_cols, cfg.sd_vars, unit_of, centroids)
+            test_mat, _, test_code, _, _ = _panel_matrix(test, mean_cols, cfg.sd_vars, unit_of, centroids)
+            target, weight = _panel_targets(train, train_code, len(train_mat), train_cap, model_cfg)
+            train_mat.flags.writeable = False
+            target.flags.writeable = False
+            weight.flags.writeable = False
+            test_mat.flags.writeable = False
+            futures.append(
+                [pool.submit(_fit_predict_member, cfg, seed, train_mat, target, weight, test_mat) for seed in seeds]
+            )
+            test_codes.append(test_code)
+            logger.info(
+                "[FCST] regional n_units=%d kmeans_seed=%d train_rows=%d test_rows=%d",
+                n_units,
+                kmeans_seed,
+                len(train_mat),
+                len(test_mat),
+            )
+            del train_mat, test_mat, target, weight
+        for unit_futures, test_code in zip(futures, test_codes, strict=True):
+            for i, fut in enumerate(unit_futures):
+                pred = fut.result()
+                with np.errstate(over="ignore", invalid="ignore"):
+                    total[i] += np.maximum(pred, 0.0)[test_code] * test_cap
+    logger.info(
+        "[FCST] regional members=%d workers=%d sec=%.1f",
+        len(cfg.units) * len(seeds),
+        workers,
+        time.perf_counter() - t0,
+    )
     out = total / len(cfg.units)
     if not np.isfinite(out).all() or (out < 0).any():
         raise RegionalError("prediction must be finite and non-negative")

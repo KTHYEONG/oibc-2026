@@ -9,7 +9,7 @@ import math
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from src.oibc.config import (
     REFERENCE_COMP_ID,
@@ -27,6 +27,11 @@ from src.oibc.config import (
 from src.oibc.data import derived, ingest
 from src.oibc.features import panel as features_panel
 from src.oibc.submit.validate import validate_submission
+
+if TYPE_CHECKING:
+    import pandas as pd
+
+    from src.oibc.submit.build import SubmissionManifest
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +78,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     splice.add_argument("--base-sub", required=True)
     splice.add_argument("--fallback-sub", required=True)
     splice.add_argument("--sub-id", required=True)
+    scale_cmd = sub.add_parser("scale-submission")
+    scale_cmd.add_argument("--base-sub", required=True)
+    scale_cmd.add_argument("--scale", type=float, required=True)
+    scale_cmd.add_argument("--sub-id", required=True)
     rc = sub.add_parser("report-calibration")
     rc.add_argument("--run-id", required=True)
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -249,6 +258,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     elif args.command == "splice-submission":
         splice_submission(args.base_sub, args.fallback_sub, args.sub_id)
+    elif args.command == "scale-submission":
+        scale_submission(args.base_sub, args.scale, args.sub_id)
     elif args.command == "report-netting":
         import json
 
@@ -324,32 +335,63 @@ def _check_input_breaks(cfg: RunConfig, spec: CompetitionSpec, allowed: set[str]
     return notes
 
 
+def _read_submission(name: str, label: str) -> tuple[SubmissionManifest, pd.DataFrame, pd.DataFrame]:
+    """제출 폴더의 manifest·배정·예측(ts는 KST)을 읽는다. 읽기·검증 실패 시 RunnerError."""
+    import pandas as pd
+
+    from src.oibc.config import ArtifactPaths
+    from src.oibc.submit.build import SubmissionManifest
+    from src.oibc.train.runner import RunnerError
+
+    sub_dir = ArtifactPaths().submissions / name
+    try:
+        manifest = SubmissionManifest.model_validate_json((sub_dir / "manifest.json").read_text(encoding="utf-8"))
+        comp = pd.read_csv(sub_dir / "composition.csv", dtype=str)
+        fc = pd.read_csv(sub_dir / "forecast.csv", dtype={"group": str})
+        fc["ts"] = pd.to_datetime(fc["ts"], format="ISO8601").dt.tz_convert("Asia/Seoul")
+    except (OSError, KeyError, ValueError, TypeError) as exc:
+        raise RunnerError(f"{label}: unreadable submission {name} ({exc})") from exc
+    return manifest, comp, fc
+
+
+def scale_submission(base_sub: str, scale: float, sub_id: str) -> Path:
+    """base 제출의 모든 예측에 scale을 곱한 수준 헤지 제출을 만든다. scale이 (0, 2] 밖이거나 계약 위반이면 RunnerError."""
+    from src.oibc.submit.build import write_submission
+    from src.oibc.train.runner import RunnerError
+
+    if not (math.isfinite(scale) and 0.0 < scale <= 2.0):
+        raise RunnerError("scale: scale must be finite and in (0, 2]")
+    base_m, base_comp, base_fc = _read_submission(base_sub, "scale")
+    scaled = base_fc[["group", "ts"]].copy()
+    scaled["forecast_kwh"] = base_fc["forecast_kwh"].to_numpy(dtype="float64") * scale
+    note = f"level-scale base={base_sub} scale={scale!r}"
+    if base_m.note:
+        note = f"{note}; base_note={base_m.note}"
+    logger.info("[SUBMIT] scale base=%s scale=%r rows=%d", base_sub, scale, len(scaled))
+    return write_submission(
+        base_comp,
+        scaled,
+        sub_id,
+        run_id=base_m.run_id,
+        composition_id=base_m.composition_id,
+        local_metrics=base_m.local_metrics,
+        note=note,
+        calibration=base_m.calibration,
+    )
+
+
 def splice_submission(base_sub: str, fallback_sub: str, sub_id: str) -> Path:
     """단절 전은 base, 단절 후는 fallback 예측을 쓴 제출을 만든다. 계약 위반 시 RunnerError."""
     import pandas as pd
 
-    from src.oibc.config import ArtifactPaths
     from src.oibc.data.drift import detect_breaks, splice_forecasts, used_raw_variables
     from src.oibc.evaluate.registry import read_records
-    from src.oibc.submit.build import SubmissionManifest, write_submission
+    from src.oibc.submit.build import write_submission
     from src.oibc.timeaxis import op_date
     from src.oibc.train.runner import RunnerError
 
-    root = ArtifactPaths().submissions
-
-    def _read(name: str) -> tuple[SubmissionManifest, pd.DataFrame, pd.DataFrame]:
-        sub_dir = root / name
-        try:
-            manifest = SubmissionManifest.model_validate_json((sub_dir / "manifest.json").read_text(encoding="utf-8"))
-            comp = pd.read_csv(sub_dir / "composition.csv", dtype=str)
-            fc = pd.read_csv(sub_dir / "forecast.csv", dtype={"group": str})
-            fc["ts"] = pd.to_datetime(fc["ts"], format="ISO8601").dt.tz_convert("Asia/Seoul")
-        except (OSError, KeyError, ValueError, TypeError) as exc:
-            raise RunnerError(f"splice: unreadable submission {name} ({exc})") from exc
-        return manifest, comp, fc
-
-    base_m, base_comp, base_fc = _read(base_sub)
-    fb_m, _, fb_fc = _read(fallback_sub)
+    base_m, base_comp, base_fc = _read_submission(base_sub, "splice")
+    fb_m, _, fb_fc = _read_submission(fallback_sub, "splice")
     if base_m.composition_sha256 != fb_m.composition_sha256:
         raise RunnerError("splice: composition hash mismatch")
     if base_m.calibration is not None or fb_m.calibration is not None:

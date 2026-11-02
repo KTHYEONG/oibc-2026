@@ -38,9 +38,51 @@ def test_mlp_missing_features_use_train_medians_and_zero() -> None:
     expected_test = scaler.transform(np.hstack((filled_test, filled_test * filled_test[:, :1])))
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
-        actual_train, actual_test = _mlp_design(train, test, ["cs_ghi", "f0", "f1"])
+        actual_train, actual_test = _mlp_design(train, test, ["cs_ghi", "f0", "f1"], None)
     np.testing.assert_array_equal(actual_train, expected_train)
     np.testing.assert_array_equal(actual_test, expected_test)
+
+
+def test_mlp_design_clip_bounds_from_train_only() -> None:
+    from src.oibc.models.families import _mlp_design
+
+    rng = np.random.default_rng(0)
+    train = np.column_stack([rng.uniform(0.0, 1.0, 200), rng.uniform(-1.0, 1.0, 200)])
+    test = np.array([[0.5, 0.0], [100.0, 0.0]])
+    poisoned = test.copy()
+    poisoned[1, 0] = 1.0e4
+    feats = ["cs_ghi", "f0"]
+    clip = (0.01, 0.99)
+    train_a, test_a = _mlp_design(train, test, feats, clip)
+    train_b, test_b = _mlp_design(train, poisoned, feats, clip)
+    np.testing.assert_array_equal(train_a, train_b)
+    ext_train = np.concatenate([train, train * train[:, :1]], axis=1)
+    hi = np.quantile(ext_train, clip[1], axis=0)
+    lo = np.quantile(ext_train, clip[0], axis=0)
+    assert np.all(np.isfinite(test_a))
+    assert test_a.shape == (2, 4)
+    assert np.array_equal(test_a, test_b)
+    raw_test_ext = np.concatenate([test, test * test[:, :1]], axis=1)
+    clipped = np.clip(raw_test_ext, lo, hi)
+    assert np.all(clipped >= lo) and np.all(clipped <= hi)
+
+
+def test_mlp_design_constant_column_finite() -> None:
+    from src.oibc.models.families import _mlp_design
+
+    train = np.column_stack([np.linspace(0.0, 1.0, 50), np.full(50, 3.0)])
+    test = np.array([[0.5, 3.0], [2.0, 9.0]])
+    train_s, test_s = _mlp_design(train, test, ["cs_ghi", "const"], (0.1, 0.9))
+    assert np.isfinite(train_s).all()
+    assert np.isfinite(test_s).all()
+
+
+def test_mlp_design_missing_cs_ghi_raises() -> None:
+    from src.oibc.models.families import _mlp_design
+
+    train = np.ones((5, 2))
+    with pytest.raises(FamilyError):
+        _mlp_design(train, train, ["f0", "f1"], None)
 
 
 def test_mlp_warning_filters_restored_and_worker_counts_match() -> None:

@@ -110,7 +110,16 @@ def fit_predict_catboost(
     return out
 
 
-def _mlp_design(train_mat: np.ndarray, test_mat: np.ndarray, feat_cols: list[str]) -> tuple[np.ndarray, np.ndarray]:
+def _mlp_design(
+    train_mat: np.ndarray,
+    test_mat: np.ndarray,
+    feat_cols: list[str],
+    clip_quantiles: tuple[float, float] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """학습 행렬로만 적합한 결측 대체·범위 제한·표준화를 적용한다. cs_ghi가 없으면 FamilyError.
+
+    범위 제한 경계는 확장된 학습 행렬의 분위수로만 정하며, 시험 행렬 통계는 쓰지 않는다.
+    """
     try:
         cs_idx = feat_cols.index("cs_ghi")
     except ValueError as exc:
@@ -124,6 +133,12 @@ def _mlp_design(train_mat: np.ndarray, test_mat: np.ndarray, feat_cols: list[str
     cs_test = test_filled[:, cs_idx : cs_idx + 1]
     train_ext = np.concatenate([train_filled, train_filled * cs_train], axis=1)
     test_ext = np.concatenate([test_filled, test_filled * cs_test], axis=1)
+    if clip_quantiles is not None:
+        lo_q, hi_q = clip_quantiles
+        lo_b = np.quantile(train_ext, lo_q, axis=0)
+        hi_b = np.quantile(train_ext, hi_q, axis=0)
+        train_ext = np.clip(train_ext, lo_b, hi_b)
+        test_ext = np.clip(test_ext, lo_b, hi_b)
     scaler = StandardScaler()
     train_scaled = scaler.fit_transform(train_ext)
     test_scaled = scaler.transform(test_ext)
@@ -143,7 +158,9 @@ def fit_predict_mlp(
         train_mat, test_mat, target, weight, test_code, test_cap, feat_cols = _common_panel(
             train, test, features, site_geo, model_cfg, int(n_units), int(kmeans_seed)
         )
-        train_scaled, test_scaled = _mlp_design(train_mat, test_mat, feat_cols)
+        train_scaled, test_scaled = _mlp_design(
+            train_mat, test_mat, feat_cols, model_cfg.families.mlp_clip_quantiles
+        )
         train_scaled.flags.writeable = False
         target_c = np.asarray(target, dtype="float64")
         weight_c = np.asarray(weight, dtype="float64")

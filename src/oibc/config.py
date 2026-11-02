@@ -168,6 +168,29 @@ class FeatureConfig(BaseModel):
         return self
 
 
+class DriftConfig(BaseModel):
+    """원천 예보 단절 탐지 임계값. 값은 `scratch/lb/l15` 보정 결과다."""
+
+    model_config = ConfigDict(frozen=True)
+
+    range_margin_frac: float = 0.05
+    range_share: float = 0.01
+    dispersion_factor: float = 1.5
+
+    @model_validator(mode="after")
+    def _check_drift(self) -> DriftConfig:
+        for name in ("range_margin_frac", "range_share", "dispersion_factor"):
+            if not isfinite(getattr(self, name)):
+                raise ValueError(f"{name} must be finite")
+        if self.range_margin_frac < 0.0:
+            raise ValueError("range_margin_frac must be >= 0")
+        if not 0.0 < self.range_share < 1.0:
+            raise ValueError("range_share must be in (0, 1)")
+        if not self.dispersion_factor > 1.0:
+            raise ValueError("dispersion_factor must be > 1")
+        return self
+
+
 class CalibrationConfig(BaseModel):
     """운량 선형 사후 보정 격자·입력 변수 설정."""
 
@@ -369,9 +392,14 @@ class FamilyConfig(BaseModel):
     mlp_max_iter: int = 200
     mlp_validation_fraction: float = 0.1
     mlp_n_iter_no_change: int = 15
+    mlp_clip_quantiles: tuple[float, float] | None = None
 
     @model_validator(mode="after")
     def _check_families(self) -> FamilyConfig:
+        if self.mlp_clip_quantiles is not None:
+            lo, hi = self.mlp_clip_quantiles
+            if not (isfinite(lo) and isfinite(hi) and 0.0 <= lo < hi <= 1.0):
+                raise ValueError("mlp_clip_quantiles must be finite with 0 <= lo < hi <= 1")
         for name in ("cat_weight", "mlp_weight"):
             if not isfinite(getattr(self, name)) or not 0.0 <= getattr(self, name) <= 1.0:
                 raise ValueError(f"{name} must be finite and in [0, 1]")

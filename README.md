@@ -105,7 +105,7 @@ flowchart LR
 
 | 구분 | 사용 기술 |
 | :--- | :--- |
-| 언어·환경 | Python 3.11, uv |
+| 언어·환경 | Python 3.12, uv |
 | 모델 | LightGBM(L1), CatBoost, scikit-learn(K-means, MLP) |
 | 데이터 | pandas, NumPy, PyArrow(Parquet), SciPy |
 | 설정·검증 | Pydantic |

@@ -20,4 +20,4 @@
 ## 4. Repository Language Conventions
 - **Korean for Humans:** Documentation (`docs/architecture/`, `docs/specs/`, READMEs), docstrings, and in-line comments are written in concise natural Korean (한국어), because the owner reads and reviews them in Korean.
 - **English for Machines:** Identifiers, code, file paths, column names, CLI flags, and commit-independent technical terms stay in English; quote them verbatim inside Korean prose.
-- **Agent Instruction Files:** `AGENTS.md`, `.agents/rules/`, and `.agents/skills/` remain in English for deterministic agent behavior.
+- **Agent Instruction Files:** `AGENTS.md` and `.agents/rules/` remain in English for deterministic agent behavior.

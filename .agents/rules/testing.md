@@ -7,7 +7,6 @@
 - **Pragmatic Invariant Verification (Zero Ceremony):**
   - *Direct Execution (Bug fixes, localized changes, data probes, scripts):* Implement directly with targeted invariant guard tests and verify via the project toolchain. Formal specs are not required for localized work.
   - *Contract Design (Complex interfaces, multi-component pipelines):* Formulate explicit interface contracts and invariant scenarios (`docs/specs/*_spec.md`) before implementation.
-  - *On-Demand Utilities:* Skills (`probe`, `spec`, `implement`, `check`) are independent tools, not a mandatory sequential conveyor belt.
 - **Observable Behavior & Invariants:** Verify return contracts, state mutations, conservation laws, and error conditions rather than private implementation details or mock call-counts.
 - **In-Memory & Minimal Inputs:** Use the smallest deterministic synthetic data sufficient to test target logic near-instantaneously; never load multi-year disk datasets in unit tests.
 - **Functional Correctness Over Stochastic Outcomes:** Unit and integration tests verify contract correctness, edge cases, and schema transformations—never long-horizon statistical convergence or leaderboard outcomes; score comparisons belong in recorded `scratch/` experiments.

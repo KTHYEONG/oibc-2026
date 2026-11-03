@@ -1099,3 +1099,12 @@ def test_scale_submission_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("src.oibc.pipeline.scale_submission", lambda base, s, sid: calls.append((base, s, sid)))
     assert main(["scale-submission", "--base-sub", "b", "--scale", "0.98", "--sub-id", "s"]) == 0
     assert calls == [("b", 0.98, "s")]
+
+
+def test_gfs_hourly_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.data.external_gfs as gfs_mod
+
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(gfs_mod, "build_gfs_hourly", lambda *args: calls.append(args))
+    assert main(["gfs-hourly"]) == 0
+    assert len(calls) == 1

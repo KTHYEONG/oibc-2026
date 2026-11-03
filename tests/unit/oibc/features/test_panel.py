@@ -98,6 +98,10 @@ def _env(tmp_path: Path, spec: CompetitionSpec, cfg: FeatureConfig) -> DataPaths
         for i, var in enumerate(variables):
             fc[var] = ((hours + i * 7.0 + fc["round"].to_numpy(dtype="float64")) % 100).astype("float32")
         fc.to_parquet(derived / f"forecast_filled_{provider}.parquet", index=False)
+    gfs = pd.DataFrame({"ts": ts_all})
+    for j, col in enumerate(cfg.gfs.feature_columns()):
+        gfs[col] = ((ts_all.dt.hour.to_numpy(dtype="float64") * 10.0 + j) % 97).astype("float32")
+    gfs.to_parquet(derived / "gfs_hourly.parquet", index=False)
     return DataPaths(canonical_dir=canonical, derived_dir=derived, features_dir=tmp_path / "features")
 
 
@@ -149,6 +153,47 @@ def test_feature_columns_all_groups(tmp_path: Path) -> None:
     assert any(c.endswith("_rdiff") for c in cols)
     with pytest.raises(PanelError):
         feature_columns(panel.drop(columns=["cs_ghi"]), FeatureConfig())
+
+
+def test_ext_features_identical_across_sites_per_hour(tmp_path: Path) -> None:
+    spec, cfg = _spec(), FeatureConfig()
+    paths = _env(tmp_path, spec, cfg)
+    panel = build_panel(paths, spec, cfg)
+    ext = cfg.gfs.feature_columns()
+    assert set(ext) <= set(feature_columns(panel, cfg))
+    assert (panel.groupby("ts")[ext].nunique(dropna=False) == 1).all().all()
+    src = pd.read_parquet(paths.derived_dir / "gfs_hourly.parquet").set_index("ts")
+    joined = panel.drop_duplicates("ts").set_index("ts")[ext]
+    np.testing.assert_array_equal(joined.to_numpy(), src.loc[joined.index, ext].to_numpy())
+
+
+def test_ext_group_toggle_and_missing_table(tmp_path: Path) -> None:
+    spec = _spec()
+    no_ext = FeatureConfig(groups=frozenset({"cs", "rd", "day", "fleet"}))
+    paths = _env(tmp_path, spec, no_ext)
+    (paths.derived_dir / "gfs_hourly.parquet").unlink()
+    panel = build_panel(paths, spec, no_ext)
+    assert not any(c.startswith("gfs") for c in feature_columns(panel, no_ext))
+    with pytest.raises(PanelError, match="ext"):
+        build_panel(paths, spec, FeatureConfig())
+
+
+def test_ext_missing_columns_rejected(tmp_path: Path) -> None:
+    spec, cfg = _spec(), FeatureConfig()
+    paths = _env(tmp_path, spec, cfg)
+    gfs = pd.read_parquet(paths.derived_dir / "gfs_hourly.parquet")
+    gfs.drop(columns=[cfg.gfs.feature_columns()[0]]).to_parquet(paths.derived_dir / "gfs_hourly.parquet", index=False)
+    with pytest.raises(PanelError, match="missing columns"):
+        build_panel(paths, spec, cfg)
+
+
+def test_ext_duplicate_ts_rejected(tmp_path: Path) -> None:
+    spec, cfg = _spec(), FeatureConfig()
+    paths = _env(tmp_path, spec, cfg)
+    gfs = pd.read_parquet(paths.derived_dir / "gfs_hourly.parquet")
+    pd.concat([gfs, gfs.head(1)]).to_parquet(paths.derived_dir / "gfs_hourly.parquet", index=False)
+    with pytest.raises(PanelError, match="duplicate"):
+        build_panel(paths, spec, cfg)
 
 
 def test_eval_only_nan_rejected(tmp_path: Path) -> None:

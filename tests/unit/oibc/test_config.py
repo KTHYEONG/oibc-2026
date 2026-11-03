@@ -3,7 +3,7 @@ import pytest
 from pathlib import Path
 from pydantic import ValidationError
 
-from src.oibc.config import ArtifactPaths, CompetitionSpec, ComposeConfig, DataPaths, FeatureConfig, FoldSpec, ModelConfig, RegionalConfig, RunConfig, ValidationConfig, repo_root
+from src.oibc.config import ArtifactPaths, CompetitionSpec, ComposeConfig, DataPaths, ExternalGfsConfig, FeatureConfig, FoldSpec, ModelConfig, RegionalConfig, RunConfig, ValidationConfig, repo_root
 
 
 def test_default_spec_self_consistent() -> None:
@@ -185,8 +185,31 @@ def test_features_dir_under_repo_root(tmp_path: Path) -> None:
 
 def test_feature_config_defaults_valid() -> None:
     cfg = FeatureConfig()
-    assert cfg.groups == {"cs", "rd", "day", "fleet"}
+    assert cfg.groups == {"cs", "rd", "day", "fleet", "ext"}
     assert cfg.day_round in CompetitionSpec().rounds
+
+
+def test_external_gfs_config_contract() -> None:
+    cfg = ExternalGfsConfig()
+    cols = cfg.feature_columns()
+    assert len(cols) == len(set(cols)) == 3 * len(cfg.variables) + 2 * len(cfg.neighbor_vars) + len(cfg.daymean_vars)
+    assert all(c.startswith("gfs00_") for c in cols)
+    with pytest.raises(ValidationError, match="run_hours"):
+        ExternalGfsConfig(run_hours=(3,))
+    with pytest.raises(ValidationError, match="inner box"):
+        ExternalGfsConfig(inner_lat=(30.0, 38.0))
+    with pytest.raises(ValidationError, match="unknown gfs variable"):
+        ExternalGfsConfig(daymean_vars=("snow",))
+    with pytest.raises(ValidationError, match="init_start_date"):
+        ExternalGfsConfig(init_start_date="2026-07-01")
+    with pytest.raises(ValidationError, match="ISO dates"):
+        ExternalGfsConfig(init_end_date="not-a-date")
+    with pytest.raises(ValidationError, match="https"):
+        ExternalGfsConfig(noaa_bucket_url="file:///tmp")
+    with pytest.raises(ValidationError, match="increasing"):
+        ExternalGfsConfig(box_lon=(131.5, 124.0))
+    with pytest.raises(ValidationError, match="inner box"):
+        ExternalGfsConfig(inner_lon=(120.0, 129.0))
 
 
 def test_feature_config_subset_violation_rejected() -> None:

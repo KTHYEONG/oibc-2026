@@ -44,6 +44,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_parser("ingest")
     sub.add_parser("derive")
     sub.add_parser("features")
+    gfs_fetch = sub.add_parser("gfs-fetch")
+    gfs_fetch.add_argument("--workers", type=int, default=16)
+    sub.add_parser("gfs-audit")
+    sub.add_parser("gfs-hourly")
     validate_cmd = sub.add_parser("validate-submission")
     validate_cmd.add_argument("--composition", type=Path, required=True)
     validate_cmd.add_argument("--forecast", type=Path, required=True)
@@ -94,6 +98,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         derived.build_derived(DataPaths(), CompetitionSpec())
     elif args.command == "features":
         features_panel.build_features(DataPaths(), CompetitionSpec(), FeatureConfig())
+    elif args.command == "gfs-fetch":  # pragma: no cover - 네트워크 수집
+        from src.oibc.data.external_gfs import fetch_gfs
+
+        fetch_gfs(DataPaths(), FeatureConfig(), workers=args.workers)
+    elif args.command == "gfs-audit":  # pragma: no cover - 네트워크 수집
+        from src.oibc.data.external_gfs import audit_publication
+
+        audit_publication(DataPaths(), FeatureConfig())
+    elif args.command == "gfs-hourly":
+        from src.oibc.data.external_gfs import build_gfs_hourly
+
+        build_gfs_hourly(DataPaths(), CompetitionSpec(), FeatureConfig())
     elif args.command == "validate-submission":
         report = validate_submission(args.composition, args.forecast)
         for warn in report.warnings:

@@ -1,0 +1,10 @@
+forbidden_force_push_flags = ["--force", "-f", "--force-with-lease", "--mirror"]
+coarse_risk_pattern = '\b(rm|git\s+push)\b'
+forbidden_staged_prefixes = ["scratch/", "tmp/", "docs/specs/", "data/", "artifacts/", "oibc_submit_", "catboost_info/"]
+forbidden_name_globs = [".env", ".env.*", ".envrc", "*.pem", "*.key", "*.csv", "*.parquet", "*.zip", "*.pkl", "*.npy", "*.npz", "*.pt", "*.ckpt", "*.joblib", "*.cbm", "*.feather", "*.duckdb"]
+allowed_staged_names = [".gitkeep"]
+max_staged_bytes = 1000000
+
+[[deny_tools]]
+tool = 'WebFetch|WebSearch|Artifact|ArtifactData|ArtifactComments|ArtifactCheck|RemoteTrigger|mcp__claude_ai_.*'
+reason = "Blocked: competition data must not leave this machine (web tools, Artifact/Docs/MCP publishing). See AGENTS.md section 1 data egress ban."

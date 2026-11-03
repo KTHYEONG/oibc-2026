@@ -38,6 +38,8 @@ Every rule below is a verified competition requirement. If a task conflicts with
 - **Quality gate:** `uv run python tools/verify.py`
 - **Tests:** `uv run pytest`
 - **Commits:** run the project's `commit` skill.
+- Instruction budget: `uv run python tools/instruction_budget.py`
+- Commit guard: git config core.hooksPath .githooks (one-time per clone). Claude Code also runs a Bash guard hook (`.claude/settings.json`); Codex/agy get only the git hook.
 - Required tests cover: settlement formula, timestamp alignment / right-closed convention, cutoff leakage prevention, VPP assignment validity (253 plants, exactly-once, capacity), and submission schema.
 - Record config, random seeds, validation periods, model parameters, and results for every meaningful experiment.
 
@@ -48,12 +50,12 @@ Every rule below is a verified competition requirement. If a task conflicts with
 - **Report honestly:** distinguish verified requirements, assumptions, and proposals; state test results and unresolved limitations accurately.
 
 ## 6. Rule Routing
-- **Domain invariants:** [domain.md](.agents/rules/domain.md) — *Settlement objective, temporal causality, VPP composition, forecasting validation, and reproducibility.*
-- **Testing & quality:** [testing.md](.agents/rules/testing.md) — *Invariant-driven testing, boundary conditions, failure isolation, and diff-coverage.*
-- **Architecture & standards:** [code-style.md](.agents/rules/code-style.md) — *Module boundaries, typed contracts, and toolchain alignment.*
-- **Documentation & comments:** [documentation.md](.agents/rules/documentation.md) — *Docstrings, specs, and non-obvious rationale.*
-- **Performance:** [performance.md](.agents/rules/performance.md) — *Vectorized panel builds, optimizer hot loops, and resource budgets.*
-- **Logging:** [logging.md](.agents/rules/logging.md) — *Structured logging, category taxonomy, and data-use hygiene.*
+- Before touching `src/**`, `tests/**`, `tools/**`, or settlement, cutoff, composition, validation, or submission logic: read `.agents/rules/domain.md`
+- Before touching `tests/**`, test tooling, or fixtures: read `.agents/rules/testing.md`
+- Before changing module boundaries, typing contracts, or toolchain config: read `.agents/rules/code-style.md`
+- Before touching any logging call, log format, or data-use hygiene: read `.agents/rules/logging.md`
+- Before touching panel builds, optimizer loops, or parallelism: read `.agents/rules/performance.md`
+- Before touching docstrings, comments, or `docs/**`: read `.agents/rules/documentation.md`
 
 ## 7. Workflow Profile
 - verify: `uv run python tools/verify.py`

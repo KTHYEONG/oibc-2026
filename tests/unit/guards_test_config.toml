@@ -1,0 +1,20 @@
+timezone = "Asia/Seoul"
+freeze_start = "08:10"
+freeze_end = "22:00"
+freeze_command_patterns = ['\bdocker(-| )compose\b.*\b(up|down|restart|recreate|build|rm|stop|start)\b', '\bdocker\s+(restart|stop|rm|kill)\b', 'vps-deploy-lib\.sh', 'krx-deferred-recreate', '\bsystemctl\b.*\b(start|restart|stop|reload)\b.*\bkrx-']
+order_cli_markers = ["src.cli.main", "src/cli/main.py"]
+order_subcommands = ["order", "order-cancel", "order-resolve"]
+exec_mode_env = "KRX_ALPHA_EXEC_MODE"
+allowed_exec_modes = ["paper", "mock"]
+live_arm_env = "KRX_ALPHA_EXEC_LIVE_ARMED"
+forbidden_force_push_flags = ["--force", "-f", "--force-with-lease", "--mirror"]
+coarse_risk_pattern = '\b(rm|docker|systemctl|git\s+push)\b|src[./]cli[./]main'
+forbidden_staged_prefixes = ["scratch/", "tmp/", "docs/specs/"]
+forbidden_name_globs = [".env", ".env.*", ".envrc", "*.pem", "*.key"]
+allowed_staged_names = [".gitkeep"]
+freeze_hint = "Defer to the 22:00 KST krx-deferred-recreate timer or run after the freeze ends."
+max_staged_bytes = 5000000
+
+[[deny_tools]]
+tool = "WebFetch|WebSearch"
+reason = "Blocked: web access is denied in this project. Use the local data sources instead."

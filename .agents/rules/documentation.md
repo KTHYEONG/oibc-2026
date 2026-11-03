@@ -1,3 +1,9 @@
+---
+paths:
+  - "src/**"
+  - "tests/**"
+  - "docs/**"
+---
 # Documentation & Code Commenting Directives
 
 > **Explain the non-obvious "Why" behind system contracts and architectural constraints, never the mechanical "What" visible in code. Keep code self-documenting, comments minimal, and eliminate narrative step-by-step bloat.**

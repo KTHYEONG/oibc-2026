@@ -1,3 +1,8 @@
+---
+paths:
+  - "src/**"
+  - "tools/**"
+---
 # Code Style & Engineering Standards
 
 > **Respect existing architecture and conventions. Maintain strong typed contracts at public boundaries without breaking scope. Reconcile code with specifications objectively, and keep every pipeline stage reproducible.**

@@ -31,7 +31,7 @@ Every rule below is a verified competition requirement. If a task conflicts with
 - **Bias toward action:** for data queries, scratch diagnostics, and root-cause isolation, execute immediately. Run experiments under `scratch/`. Never modify production code or commit in response to open-ended diagnostic questions.
 - **Inspect before building:** before significant changes, read the relevant code, actual data schemas/units/timestamps/missing values, and existing experiments.
 - **Smallest measurable step:** simple baselines before complex models; every experiment has a hypothesis and a measurable outcome under identical validation conditions. Preserve working baselines.
-- **Skills are independent tools** (`probe`, `spec`, `implement`, `check`, `refactor`, `commit`), not a pipeline. When a slash command is invoked, execute only that skill and halt for review. Specs live under `docs/specs/` (gitignored).
+- **Skills:** user-level and project-agnostic (`probe`, `spec`, `implement`, `check`, `refactor`, `commit`, `ship`); this project's policy is the Workflow Profile in §7. Individual slash invocations execute only that skill and halt for user review; `/ship` is the explicit autonomy opt-in for the approved implement → check → commit chain. Specs live under `docs/specs/` (gitignored).
 - **Workspace hygiene:** temporary files and exploration stay in `scratch/`. Never commit raw data, model checkpoints, caches, or large generated files; never overwrite original data.
 
 ## 4. Toolchain & Verification
@@ -44,7 +44,7 @@ Every rule below is a verified competition requirement. If a task conflicts with
 ## 5. Communication & Language
 - **Korean for conversation:** explain rationales and report findings in natural Korean (한국어). In structured output cards, keep English keys/badges with Korean descriptions.
 - **Korean for documents and comments:** docs (`docs/architecture/`, `docs/specs/`), docstrings, and in-line comments are written in Korean; identifiers, code, paths, and column names stay in English.
-- **English for agent instructions:** `AGENTS.md`, `.agents/rules/`, and `.agents/skills/` are written in technical English.
+- **English for agent instructions:** `AGENTS.md` and `.agents/rules/` are written in technical English.
 - **Report honestly:** distinguish verified requirements, assumptions, and proposals; state test results and unresolved limitations accurately.
 
 ## 6. Rule Routing
@@ -54,3 +54,15 @@ Every rule below is a verified competition requirement. If a task conflicts with
 - **Documentation & comments:** [documentation.md](.agents/rules/documentation.md) — *Docstrings, specs, and non-obvious rationale.*
 - **Performance:** [performance.md](.agents/rules/performance.md) — *Vectorized panel builds, optimizer hot loops, and resource budgets.*
 - **Logging:** [logging.md](.agents/rules/logging.md) — *Structured logging, category taxonomy, and data-use hygiene.*
+
+## 7. Workflow Profile
+- verify: `uv run python tools/verify.py`
+- test_scoped: `uv run pytest {files}`
+- spec_dir: `docs/specs` (untracked; archive finished specs to `docs/specs/_done/`)
+- scratch_dir: `scratch/` (never commit)
+- high_risk_paths: `src/oibc/{submit,compose,cv,features,data,quality}/**`, `src/oibc/timeaxis.py`, `src/oibc/pipeline.py`
+- hard_stops: any egress of competition data (external AI services/APIs, external storage, public repos, Artifact/Docs/MCP publishing, WebFetch/WebSearch carrying data); plant coordinate recovery or re-identification; external sources that are not freely public/re-downloadable; using values published after the D-1 17:00 KST cutoff; uploading or submitting to the leaderboard (3/day, 20 total); any conflict with §1 competition rules (stop and report); any `rm` without previewing exact targets
+- commit_style: Korean `<type>: <summary <=50 chars>` + `- **Why:** <rationale>`; types feat/fix/refactor/chore/docs; no AI or co-author trailers; every commit via `/commit`
+- artifact_language: Korean (docs, specs, docstrings, comments; identifiers/code/paths/columns stay English)
+- report_language: Korean (card keys stay English)
+- rules: `.agents/rules/*.md`

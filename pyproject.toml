@@ -2,7 +2,7 @@
 name = "oibc-2026"
 version = "0.1.0"
 description = "POSTECH OIBC 2026 경진대회 및 정량적 최적화 파이프라인"
-requires-python = "==3.11.*"
+requires-python = "==3.12.*"
 
 dependencies = [
     "numpy>=2.0.0",
@@ -27,7 +27,7 @@ include = ["src*"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
+target-version = "py312"
 exclude = [
     "scratch",
     "logs",
@@ -104,7 +104,7 @@ markers = ["slow: marks slow integration tests"]
 
 [dependency-groups]
 external = [
-    "icechunk==2.0.0a4",
+    "icechunk==2.3.1",
     "xarray==2026.9.0",
     "zarr==3.1.6",
 ]

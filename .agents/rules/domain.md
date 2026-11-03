@@ -1,3 +1,10 @@
+---
+paths:
+  - "src/**"
+  - "tests/**"
+  - "tools/**"
+  - "docs/specs/**"
+---
 # OIBC Competition Domain Directives
 
 > **Maximize out-of-sample settlement revenue `S` (sales revenue − forecast-error penalty `W`) on unseen evaluation data under strict competition rules. Correctness, causality, and reproducibility precede model sophistication.**

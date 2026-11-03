@@ -1,3 +1,7 @@
+---
+paths:
+  - "src/**"
+---
 # Performance & Optimization Directives (Physical Invariants)
 
 > **Performance is an architectural invariant, not an afterthought. Never fake speed by silently truncating date ranges, plants, timestamps, or numerical precision. Correctness strictly precedes speed. Maximize hardware throughput within four physical boundaries.**

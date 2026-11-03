@@ -1,3 +1,8 @@
+---
+paths:
+  - "tests/**"
+  - "tools/**"
+---
 # Testing Directives & Quality Standards
 
 > **Verify observable behavior and interface contracts, not implementation internals. Maintain fast feedback loops with small deterministic inputs while isolating heavy runs. Enforce invariant verification on new logic, isolate failures with pinpoint precision, and prioritize economic correctness over vanity metrics.**

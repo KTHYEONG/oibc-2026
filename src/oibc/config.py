@@ -93,6 +93,76 @@ class DataPaths(BaseModel):
     canonical_dir: Path = repo_root() / "data" / "canonical"
     derived_dir: Path = repo_root() / "data" / "derived"
     features_dir: Path = repo_root() / "data" / "features"
+    external_dir: Path = repo_root() / "data" / "external"
+
+
+GfsKind = Literal["avg6", "inst"]
+
+
+class ExternalGfsConfig(BaseModel):
+    """외부 GFS 광역 요약 설정. 출처·공개 시각 근거는 `docs/experiments/external_sources.md`."""
+
+    model_config = ConfigDict(frozen=True)
+
+    icechunk_bucket: str = "dynamical-noaa-gfs"
+    icechunk_prefix: str = "noaa-gfs-forecast/v0.2.7.icechunk"
+    icechunk_region: str = "us-west-2"
+    noaa_bucket_url: str = "https://noaa-gfs-bdp-pds.s3.amazonaws.com"
+    init_start_date: str = "2021-05-01"  # UTC 날짜(포함)
+    init_end_date: str = "2026-06-01"  # UTC 날짜(포함)
+    run_hours: tuple[int, ...] = (0,)
+    max_lead_h: int = Field(default=48, ge=1, le=120)
+    box_lat: tuple[float, float] = (32.0, 39.5)
+    box_lon: tuple[float, float] = (124.0, 131.5)
+    inner_lat: tuple[float, float] = (34.0, 38.0)
+    inner_lon: tuple[float, float] = (126.0, 129.5)
+    # 짧은 이름 -> (dynamical 변수명, 종류). avg6 = 6시간마다 초기화되는 직전 1~6시간 평균
+    variables: dict[str, tuple[str, GfsKind]] = {
+        "sw": ("downward_short_wave_radiation_flux_surface", "avg6"),
+        "tcc": ("total_cloud_cover_atmosphere", "avg6"),
+        "lw": ("downward_long_wave_radiation_flux_surface", "avg6"),
+        "t2m": ("temperature_2m", "inst"),
+        "rh": ("relative_humidity_2m", "inst"),
+        "pr": ("precipitation_surface", "inst"),
+        "pw": ("precipitable_water_atmosphere", "inst"),
+    }
+    neighbor_vars: tuple[str, ...] = ("sw",)
+    daymean_vars: tuple[str, ...] = ("sw", "tcc")
+
+    @model_validator(mode="after")
+    def _check_gfs(self) -> ExternalGfsConfig:
+        try:
+            start, end = pd.Timestamp(self.init_start_date), pd.Timestamp(self.init_end_date)
+        except ValueError as exc:
+            raise ValueError("init dates must be ISO dates") from exc
+        if not start <= end:
+            raise ValueError("init_start_date must be <= init_end_date")
+        if not self.noaa_bucket_url.startswith("https://"):
+            raise ValueError("noaa_bucket_url must be https")
+        if not self.run_hours or any(h not in (0, 6, 12, 18) for h in self.run_hours):
+            raise ValueError("run_hours must be GFS cycles 0/6/12/18")
+        for lo, hi in (self.box_lat, self.box_lon, self.inner_lat, self.inner_lon):
+            if not lo < hi:
+                raise ValueError("box bounds must be increasing")
+        if not (self.box_lat[0] <= self.inner_lat[0] and self.inner_lat[1] <= self.box_lat[1]):
+            raise ValueError("inner box must lie inside box")
+        if not (self.box_lon[0] <= self.inner_lon[0] and self.inner_lon[1] <= self.box_lon[1]):
+            raise ValueError("inner box must lie inside box")
+        for name in (*self.neighbor_vars, *self.daymean_vars):
+            if name not in self.variables:
+                raise ValueError(f"unknown gfs variable {name!r}")
+        return self
+
+    def feature_columns(self) -> list[str]:
+        """패널에 붙는 GFS 특성 열 이름을 결정적 순서로 반환한다."""
+        cols: list[str] = []
+        for h in self.run_hours:
+            for name in self.variables:
+                cols.extend(f"gfs{h:02d}_{name}_{stat}" for stat in ("box", "in", "insd"))
+            for name in self.neighbor_vars:
+                cols.extend(f"gfs{h:02d}_{name}_in_n{off:+d}" for off in (-1, 1))
+            cols.extend(f"gfs{h:02d}_{name}_in_daymean" for name in self.daymean_vars)
+        return cols
 
 
 class FeatureConfig(BaseModel):
@@ -100,7 +170,7 @@ class FeatureConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    groups: frozenset[Literal["cs", "rd", "day", "fleet"]] = frozenset({"cs", "rd", "day", "fleet"})
+    groups: frozenset[Literal["cs", "rd", "day", "fleet", "ext"]] = frozenset({"cs", "rd", "day", "fleet", "ext"})
     day_min_elev_deg: float = 0.0
     wa_vars: tuple[str, ...] = ("wa_cloud", "wa_temp", "wa_humidity", "wa_rain", "wa_snow", "wa_wind_speed", "wa_ground_press")
     wb_vars: tuple[str, ...] = ("wb_cloud", "wb_temp", "wb_rel_hum", "wb_uv_idx", "wb_precip_prob", "wb_total_liq", "wb_vis", "wb_wind_speed", "wb_dew_point", "wb_ceiling", "wb_snow")
@@ -116,6 +186,7 @@ class FeatureConfig(BaseModel):
     day_sum_vars: tuple[str, ...] = ("wa_rain", "wb_total_liq")
     fleet_vars: tuple[str, ...] = ("wa_cloud", "wb_cloud", "wb_precip_prob", "wb_uv_idx")
     vsfleet_vars: tuple[str, ...] = ("wa_cloud", "wb_cloud", "wb_uv_idx")
+    gfs: ExternalGfsConfig = ExternalGfsConfig()
 
     @model_validator(mode="after")
     def _check_features(self) -> FeatureConfig:

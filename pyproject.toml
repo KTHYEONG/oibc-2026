@@ -103,6 +103,11 @@ pythonpath = ["."]
 markers = ["slow: marks slow integration tests"]
 
 [dependency-groups]
+external = [
+    "icechunk==2.0.0a4",
+    "xarray==2026.9.0",
+    "zarr==3.1.6",
+]
 dev = [
     "hypothesis>=6.100.0",
     "mypy>=1.10.0",

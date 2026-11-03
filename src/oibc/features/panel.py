@@ -64,6 +64,8 @@ def _all_feature_columns(cfg: FeatureConfig) -> list[str]:
     cols.extend(_day_columns(cfg))
     cols.extend(f"{v}_fleet" for v in cfg.fleet_vars)
     cols.extend(f"{v}_vsfleet" for v in cfg.vsfleet_vars)
+    if "ext" in cfg.groups:
+        cols.extend(cfg.gfs.feature_columns())
     return list(dict.fromkeys(cols))
 
 
@@ -85,6 +87,8 @@ def feature_columns(panel: pd.DataFrame, cfg: FeatureConfig) -> list[str]:
     if "fleet" in cfg.groups:
         cols.extend(f"{v}_fleet" for v in cfg.fleet_vars)
         cols.extend(f"{v}_vsfleet" for v in cfg.vsfleet_vars)
+    if "ext" in cfg.groups:
+        cols.extend(cfg.gfs.feature_columns())
     missing = [c for c in cols if c not in panel.columns]
     if missing:
         raise PanelError(f"panel: missing feature columns {missing[:5]}")
@@ -250,6 +254,9 @@ def build_panel(paths: DataPaths, spec: CompetitionSpec, cfg: FeatureConfig) -> 
     for var in cfg.vsfleet_vars:
         panel[f"{var}_vsfleet"] = (panel[f"{var}_r{cfg.day_round}"] - panel[f"{var}_fleet"]).to_numpy(dtype="float64").astype("float32")
 
+    if "ext" in cfg.groups:
+        panel = _left_join(panel, _read_gfs_hourly(paths, cfg), ["ts"])
+
     cosz64 = panel["cosz"].to_numpy(dtype="float64")
     doy = pd.DatetimeIndex(panel["ts"]).dayofyear.to_numpy(dtype="float64")
     panel["cs_ghi"] = np.asarray(clear_sky_ghi(cosz64, doy), dtype="float32")
@@ -289,6 +296,25 @@ def build_panel(paths: DataPaths, spec: CompetitionSpec, cfg: FeatureConfig) -> 
         elapsed,
     )
     return panel
+
+
+def _read_gfs_hourly(paths: DataPaths, cfg: FeatureConfig) -> pd.DataFrame:
+    """시간 키 하나로 모든 발전소에 같은 값을 붙이는 GFS 광역 요약 표를 읽는다."""
+    from src.oibc.data.external_gfs import hourly_path
+
+    path = hourly_path(paths)
+    if not path.exists():
+        raise PanelError(f"ext: missing {path}; run `pipeline gfs-hourly`")
+    cols = cfg.gfs.feature_columns()
+    table = pd.read_parquet(path)
+    missing = [c for c in ["ts", *cols] if c not in table.columns]
+    if missing:
+        raise PanelError(f"ext: gfs hourly missing columns {missing[:5]}")
+    table = table[["ts", *cols]].copy()
+    table["ts"] = table["ts"].astype(_DT)
+    if table["ts"].duplicated().any():
+        raise PanelError("ext: duplicate ts in gfs hourly")
+    return table
 
 
 def build_features(paths: DataPaths, spec: CompetitionSpec, cfg: FeatureConfig) -> Path:

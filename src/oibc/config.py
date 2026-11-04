@@ -207,6 +207,46 @@ class NoaaGfsConfig(BaseModel):
         return self
 
 
+class EcmwfRunSpec(BaseModel):
+    """대상일 D에 쓰는 ECMWF 실행 하나: init = (D - days_back) init_hour_utc UTC."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str = Field(pattern=r"^\d{2}z$")
+    days_back: int = Field(ge=1, le=3)
+    init_hour_utc: int = Field(ge=0, le=23)
+    stream: Literal["oper", "scda"]
+
+
+class EcmwfConfig(BaseModel):
+    """ECMWF Open Data IFS ssrd 2단 보정 설정. 근거·공개 시각 감사는 `docs/experiments/external_sources.md`."""
+
+    model_config = ConfigDict(frozen=True)
+
+    s3_url: str = "https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com"  # 공식 미러, 공개 시각(LastModified) 근거
+    mirror_url: str = "https://storage.googleapis.com/ecmwf-open-data"  # 같은 파일(MD5 동일), S3 요청 제한 회피용
+    resolution: str = "0p25"
+    param: str = "ssrd"
+    # 우선순위 순서: 마감 전에 공개된 가장 앞선 실행을 쓴다(e40·e46 판정)
+    runs: tuple[EcmwfRunSpec, ...] = (
+        EcmwfRunSpec(name="00z", days_back=1, init_hour_utc=0, stream="oper"),
+        EcmwfRunSpec(name="18z", days_back=2, init_hour_utc=18, stream="scda"),
+        EcmwfRunSpec(name="12z", days_back=2, init_hour_utc=12, stream="oper"),
+    )
+    target_start: str = "2024-03-07"  # ssrd 공개 시작 이후 첫 대상일(KST 날짜, 포함)
+    target_end: str = "2026-05-31"
+    block_end_hours: tuple[int, ...] = (9, 12, 15, 18)  # KST 블록 끝 시각, 블록 길이 block_hours
+    block_hours: int = Field(default=3, ge=1)
+    box_lat: tuple[float, float] = (32.0, 39.5)
+    box_lon: tuple[float, float] = (124.0, 131.5)
+    inner_lat: tuple[float, float] = (34.0, 38.0)
+    inner_lon: tuple[float, float] = (126.0, 129.5)
+    gfs_column: str = "gfs00_sw_in"
+    x_offset_wm2: float = Field(default=100.0, gt=0)
+    beta_grid: tuple[float, float, float] = (-0.2, 1.2, 0.05)  # 시작, 끝(포함), 간격
+    fit_folds: tuple[str, ...] = ("A", "B")
+
+
 class FeatureConfig(BaseModel):
     """특성 묶음·변수 목록·발행 내 변환 파라미터."""
 

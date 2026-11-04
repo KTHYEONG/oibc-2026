@@ -1168,3 +1168,93 @@ def test_gfs_compare_dispatch_parses_inits(monkeypatch: pytest.MonkeyPatch) -> N
     assert calls[1][3] is None and calls[1][2].compare_sample == 5
     with pytest.raises(gfs_mod.ExternalError, match="YYYYMMDDHH"):
         main(["gfs-compare", "--inits", "2025-07-10"])
+
+
+def _ecmwf_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sites: tuple[str, ...] = ("s1", "s2")):
+    import src.oibc.data.external_ecmwf as ec_mod
+    import src.oibc.submit.build as build_mod
+    import src.oibc.train.runner as runner_mod
+    from src.oibc.config import DataPaths
+
+    _scale_env(tmp_path, monkeypatch)
+    paths = DataPaths(canonical_dir=tmp_path / "canon", derived_dir=tmp_path / "derived")
+    paths.canonical_dir.mkdir()
+    paths.derived_dir.mkdir()
+    train_ts = pd.Timestamp("2025-03-02 11:00", tz="Asia/Seoul")
+    pd.DataFrame({"ts": [train_ts], "smp": [100.0], "k": [3]}).to_parquet(paths.canonical_dir / "smp.parquet")
+    pd.DataFrame({"ts": [train_ts], "gfs00_sw_in": [100.0]}).to_parquet(paths.derived_dir / "gfs_hourly.parquet")
+    oof = pd.DataFrame({"site_id": list(sites), "ts": [train_ts] * len(sites), "actual_kwh": 5.5, "pred_bag": 5.0})
+    monkeypatch.setattr(runner_mod, "load_oof", lambda run_id, fold, **k: oof.copy())
+    ops = [pd.Timestamp("2025-03-02"), pd.Timestamp("2026-01-22")]
+    # x = (140 - 100) / (100 + 100) = 0.2 → 학습 F=5, A=5.5에서 β=0.5
+    monkeypatch.setattr(ec_mod, "ec_blocks", lambda *a, **k: pd.DataFrame({"op": ops, "blk": [1, 1], "ec_in": [140.0, 140.0], "src": ["00z", "18z"]}))
+    monkeypatch.setattr(ec_mod, "gfs_blocks", lambda *a, **k: pd.DataFrame({"op": ops, "blk": [1, 1], "g_in": [100.0, 100.0]}))
+    calls: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: calls.append((a, k)))
+    return paths, calls
+
+
+def test_ecmwf_correct_submission_fits_beta_on_oof_and_scales_block_hours(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.pipeline import ecmwf_correct_submission
+
+    paths, calls = _ecmwf_env(tmp_path, monkeypatch)
+    ecmwf_correct_submission("base", "corr", paths=paths)
+    (_, forecast, sub_id), kwargs = calls[0]
+    assert sub_id == "corr"
+    by_ts = forecast.set_index(forecast["ts"].dt.strftime("%m-%d %H"))["forecast_kwh"]
+    # 01-22 12:00은 블록 1(10~12시)이라 ×1.1, 01-23 01:00은 블록 밖이라 그대로
+    np.testing.assert_allclose(by_ts.loc["01-22 12"].to_numpy(), 110.0, rtol=0, atol=1e-9)
+    np.testing.assert_allclose(by_ts.loc["01-23 01"].to_numpy(), 100.0, rtol=0, atol=1e-12)
+    assert kwargs["note"].startswith("ecmwf-correct base=base beta=0.5 fit_rows=4")
+    assert kwargs["run_id"] == "base-run"
+
+
+def test_ecmwf_correct_submission_rejects_oof_site_outside_composition(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.oibc.pipeline import ecmwf_correct_submission
+    from src.oibc.train.runner import RunnerError
+
+    paths, _ = _ecmwf_env(tmp_path, monkeypatch, sites=("s1", "s9"))
+    with pytest.raises(RunnerError, match="OOF site missing"):
+        ecmwf_correct_submission("base", "corr", paths=paths)
+
+
+def test_ecmwf_correct_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.pipeline as pipeline_mod
+
+    seen: list[tuple[str, str]] = []
+    monkeypatch.setattr(pipeline_mod, "ecmwf_correct_submission", lambda b, s: seen.append((b, s)))
+    assert pipeline_mod.main(["ecmwf-correct", "--base-sub", "b", "--sub-id", "s"]) == 0
+    assert seen == [("b", "s")]
+
+
+def test_ecmwf_correct_submission_contract_errors_and_base_note(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+
+    import src.oibc.data.external_ecmwf as ec_mod
+    import src.oibc.train.runner as runner_mod
+    from src.oibc.data.external_gfs import ExternalError
+    from src.oibc.pipeline import ecmwf_correct_submission
+    from src.oibc.train.runner import RunnerError
+
+    paths, calls = _ecmwf_env(tmp_path, monkeypatch)
+    manifest_path = tmp_path / "submissions" / "base" / "manifest.json"
+    manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["note"] = "level-scale base=x"
+    manifest_path.write_text(_json.dumps(manifest), encoding="utf-8")
+    ecmwf_correct_submission("base", "corr", paths=paths)
+    assert calls[0][1]["note"].endswith("; base_note=level-scale base=x")
+
+    def boom(*a: object, **k: object) -> None:
+        raise ExternalError("gfs_blocks: missing columns")
+
+    monkeypatch.setattr(ec_mod, "gfs_blocks", boom)
+    with pytest.raises(RunnerError, match="ecmwf: gfs_blocks"):
+        ecmwf_correct_submission("base", "corr", paths=paths)
+    late = pd.DataFrame({"site_id": ["s1"], "ts": [pd.Timestamp("2025-07-01 11:00", tz="Asia/Seoul")], "actual_kwh": [1.0], "pred_bag": [1.0]})
+    monkeypatch.setattr(runner_mod, "load_oof", lambda run_id, fold, **k: late)
+    with pytest.raises(RunnerError, match="beyond train_end"):
+        ecmwf_correct_submission("base", "corr", paths=paths)
+    manifest["run_id"] = None
+    manifest_path.write_text(_json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(RunnerError, match="no run_id"):
+        ecmwf_correct_submission("base", "corr", paths=paths)

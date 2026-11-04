@@ -17,6 +17,7 @@ from src.oibc.config import (
     ComposeConfig,
     DataPaths,
     DriftConfig,
+    EcmwfConfig,
     FamilyConfig,
     FeatureConfig,
     ModelConfig,
@@ -53,6 +54,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     gfs_cmp.add_argument("--sample", type=int, default=None)
     sub.add_parser("gfs-audit")
     sub.add_parser("gfs-hourly")
+    ec_fetch = sub.add_parser("ecmwf-fetch")
+    ec_fetch.add_argument("--runs", nargs="+", default=None)
+    ec_fetch.add_argument("--workers", type=int, default=8)
+    ec_audit = sub.add_parser("ecmwf-audit")
+    ec_audit.add_argument("--workers", type=int, default=8)
+    ec_corr = sub.add_parser("ecmwf-correct")
+    ec_corr.add_argument("--base-sub", required=True)
+    ec_corr.add_argument("--sub-id", required=True)
     validate_cmd = sub.add_parser("validate-submission")
     validate_cmd.add_argument("--composition", type=Path, required=True)
     validate_cmd.add_argument("--forecast", type=Path, required=True)
@@ -122,6 +131,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         from src.oibc.data.external_gfs import build_gfs_hourly
 
         build_gfs_hourly(DataPaths(), CompetitionSpec(), FeatureConfig())
+    elif args.command == "ecmwf-fetch":  # pragma: no cover - 네트워크 수집
+        from src.oibc.data.external_ecmwf import fetch_ecmwf
+
+        exit_code = 1 if fetch_ecmwf(DataPaths(), EcmwfConfig(), runs=args.runs, workers=args.workers) else 0
+    elif args.command == "ecmwf-audit":  # pragma: no cover - 네트워크 수집
+        from src.oibc.data.external_ecmwf import audit_ecmwf
+
+        audit_ecmwf(DataPaths(), EcmwfConfig(), workers=args.workers)
+    elif args.command == "ecmwf-correct":
+        ecmwf_correct_submission(args.base_sub, args.sub_id)
     elif args.command == "validate-submission":
         report = validate_submission(args.composition, args.forecast)
         for warn in report.warnings:
@@ -498,6 +517,89 @@ def splice_submission(base_sub: str, fallback_sub: str, sub_id: str) -> Path:
         local_metrics=fb_m.local_metrics,
         note=note,
         spec=spec,
+    )
+
+
+def ecmwf_correct_submission(
+    base_sub: str,
+    sub_id: str,
+    *,
+    cfg: EcmwfConfig | None = None,
+    paths: DataPaths | None = None,
+    spec: CompetitionSpec | None = None,
+) -> Path:
+    """base 제출에 ECMWF 2단 보정 1+βx를 곱한 제출을 만든다.
+
+    β는 base 제출 run의 학습 기간 OOF(그룹 합, SMP·k 가중 L1)로만 맞춘다. 계약 위반 시 RunnerError.
+    """
+    import pandas as pd
+
+    from src.oibc.data.external_ecmwf import (
+        correction_multiplier,
+        ec_blocks,
+        fit_beta,
+        fit_frame,
+        gfs_blocks,
+        x_table,
+    )
+    from src.oibc.data.external_gfs import ExternalError, hourly_path
+    from src.oibc.submit.build import write_submission
+    from src.oibc.train.runner import RunnerError, load_oof
+
+    ec_cfg = cfg if cfg is not None else EcmwfConfig()
+    data_paths = paths if paths is not None else DataPaths()
+    comp_spec = spec if spec is not None else CompetitionSpec()
+    base_m, base_comp, base_fc = _read_submission(base_sub, "ecmwf")
+    if base_m.run_id is None:
+        raise RunnerError("ecmwf: base submission has no run_id")
+    group_of = base_comp.set_index("site_id")["group"]
+    parts = []
+    for fold in ec_cfg.fit_folds:
+        oof = load_oof(base_m.run_id, fold)
+        grp = oof["site_id"].astype(str).map(group_of)
+        if grp.isna().any():
+            raise RunnerError(f"ecmwf: OOF site missing from composition (fold={fold})")
+        parts.append(oof.assign(group=grp).groupby(["group", "ts"])[["actual_kwh", "pred_bag"]].sum().reset_index())
+    group_oof = pd.concat(parts, ignore_index=True)
+    if (group_oof["ts"] > comp_spec.train_end).any():
+        raise RunnerError("ecmwf: OOF beyond train_end")
+    smp = pd.read_parquet(data_paths.canonical_dir / "smp.parquet", columns=["ts", "smp", "k"])
+    weights = pd.Series((smp["smp"].astype("float64") * smp["k"].astype("float64")).to_numpy(), index=smp["ts"])
+    try:
+        xt = x_table(
+            ec_blocks(data_paths, ec_cfg, comp_spec),
+            gfs_blocks(pd.read_parquet(hourly_path(data_paths)), ec_cfg),
+            ec_cfg,
+        )
+        h = fit_frame(group_oof, weights, xt, ec_cfg)
+        beta = fit_beta(
+            h["pred_bag"].to_numpy(), h["actual_kwh"].to_numpy(), h["w"].to_numpy(), h["x"].to_numpy(), ec_cfg
+        )
+        mult = correction_multiplier(base_fc["ts"], xt, beta, ec_cfg)
+    except ExternalError as exc:
+        raise RunnerError(f"ecmwf: {exc}") from exc
+    out = base_fc[["group", "ts"]].copy()
+    out["forecast_kwh"] = base_fc["forecast_kwh"].to_numpy(dtype="float64") * mult
+    src_counts = xt["src"].value_counts().to_dict()
+    note = f"ecmwf-correct base={base_sub} beta={beta!r} fit_rows={len(h)} x_src={src_counts}"
+    if base_m.note:
+        note = f"{note}; base_note={base_m.note}"
+    logger.info(
+        "[SUBMIT] ecmwf-correct base=%s beta=%r fit_rows=%d corrected=%d",
+        base_sub,
+        beta,
+        len(h),
+        int((mult != 1.0).sum()),
+    )
+    return write_submission(
+        base_comp,
+        out,
+        sub_id,
+        run_id=base_m.run_id,
+        composition_id=base_m.composition_id,
+        local_metrics=base_m.local_metrics,
+        note=note,
+        calibration=base_m.calibration,
     )
 
 

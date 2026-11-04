@@ -146,10 +146,14 @@ uv sync --group external                  # 외부 GFS 수집 의존성
 uv run python -m src.oibc.pipeline gfs-fetch      # dynamical.org GFS 상자 npz
 uv run python -m src.oibc.pipeline gfs-audit      # NOAA 원본 공개 시각 감사
 uv run python -m src.oibc.pipeline gfs-hourly     # 대상일 시간별 광역 요약
+uv run python -m src.oibc.pipeline ecmwf-fetch    # ECMWF Open Data ssrd 상자 npz (00z D-1, 18z D-2, 12z D-2)
+uv run python -m src.oibc.pipeline ecmwf-audit    # S3 원본 LastModified로 실행별 공개 시각 감사
 uv run python -m src.oibc.pipeline features
 uv run python -m src.oibc.pipeline compose --comp-id <배정 이름>
 uv run python -m src.oibc.pipeline validate-run --run-id <이름> --hypothesis "<가설>"
 uv run python -m src.oibc.pipeline submit --run-id <이름> --sub-id <제출 이름>
+uv run python -m src.oibc.pipeline scale-submission --base-sub <제출> --scale 0.97 --months 11 12 1 2 --sub-id <제출 이름>
+uv run python -m src.oibc.pipeline ecmwf-correct --base-sub <제출> --sub-id <제출 이름>   # ECMWF 2단 보정
 uv run python -m src.oibc.pipeline validate-submission --composition <composition.csv> --forecast <forecast.csv>
 ```
 

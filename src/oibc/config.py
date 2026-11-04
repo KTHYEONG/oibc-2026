@@ -165,6 +165,48 @@ class ExternalGfsConfig(BaseModel):
         return cols
 
 
+NoaaStat = Literal["ave", "inst"]
+
+
+class NoaaGfsConfig(BaseModel):
+    """NOAA 원본 GRIB 예비 수집 경로의 필드 대응과 동등성 허용오차.
+
+    대응·허용오차 근거는 `docs/specs/gfs_noaa_fallback_spec.md`(dynamical 재가공본과 표본 비교).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    # dynamical 변수명 -> (GRIB 짧은 이름, idx 층 문자열, 통계, 더할 오프셋)
+    fields: dict[str, tuple[str, str, NoaaStat, float]] = {
+        "downward_short_wave_radiation_flux_surface": ("DSWRF", "surface", "ave", 0.0),
+        "total_cloud_cover_atmosphere": ("TCDC", "entire atmosphere", "ave", 0.0),
+        "downward_long_wave_radiation_flux_surface": ("DLWRF", "surface", "ave", 0.0),
+        "temperature_2m": ("TMP", "2 m above ground", "inst", -273.15),
+        "relative_humidity_2m": ("RH", "2 m above ground", "inst", 0.0),
+        "precipitable_water_atmosphere": ("PWAT", "entire atmosphere (considered as a single layer)", "inst", 0.0),
+        "precipitation_surface": ("PRATE", "surface", "ave", 0.0),
+    }
+    # dynamical이 1시간 값으로 풀어 저장한 변수: NOAA 구간 평균을 같은 방식으로 풀어 저장한다
+    hourly_from_ave: tuple[str, ...] = ("precipitation_surface",)
+    # 짧은 이름별 `_box`·`_in` 요약 허용오차(단위는 변수 단위). `_insd`는 insd_tol_factor배
+    equiv_tol: dict[str, float] = {"sw": 2.0, "tcc": 0.5, "lw": 2.0, "t2m": 0.05, "rh": 0.1, "pr": 1e-5, "pw": 0.05}
+    insd_tol_factor: float = Field(default=3.0, gt=0)
+    compare_sample: int = Field(default=24, ge=1)
+    compare_seed: int = 0
+
+    @model_validator(mode="after")
+    def _check_noaa(self) -> NoaaGfsConfig:
+        for name in self.hourly_from_ave:
+            if name not in self.fields:
+                raise ValueError(f"hourly_from_ave: unknown field {name!r}")
+            if self.fields[name][2] != "ave":
+                raise ValueError(f"hourly_from_ave: {name!r} must be an 'ave' field")
+        for name, tol in self.equiv_tol.items():
+            if not isfinite(tol) or tol <= 0.0:
+                raise ValueError(f"equiv_tol[{name!r}] must be finite and > 0")
+        return self
+
+
 class FeatureConfig(BaseModel):
     """특성 묶음·변수 목록·발행 내 변환 파라미터."""
 

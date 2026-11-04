@@ -104,6 +104,8 @@ markers = ["slow: marks slow integration tests"]
 
 [dependency-groups]
 external = [
+    "eccodes==2.50.0",
+    "eccodeslib==2.50.0.33; sys_platform != 'win32'",
     "icechunk==2.3.1",
     "xarray==2026.9.0",
     "zarr==3.1.6",

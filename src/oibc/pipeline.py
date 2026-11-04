@@ -20,6 +20,7 @@ from src.oibc.config import (
     FamilyConfig,
     FeatureConfig,
     ModelConfig,
+    NoaaGfsConfig,
     QualityConfig,
     RegionalConfig,
     RunConfig,
@@ -46,6 +47,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_parser("features")
     gfs_fetch = sub.add_parser("gfs-fetch")
     gfs_fetch.add_argument("--workers", type=int, default=16)
+    gfs_fetch.add_argument("--source", choices=("dynamical", "noaa"), default="dynamical")
+    gfs_cmp = sub.add_parser("gfs-compare")
+    gfs_cmp.add_argument("--inits", nargs="*", default=None)
+    gfs_cmp.add_argument("--sample", type=int, default=None)
     sub.add_parser("gfs-audit")
     sub.add_parser("gfs-hourly")
     validate_cmd = sub.add_parser("validate-submission")
@@ -102,7 +107,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "gfs-fetch":  # pragma: no cover - 네트워크 수집
         from src.oibc.data.external_gfs import fetch_gfs
 
-        fetch_gfs(DataPaths(), FeatureConfig(), workers=args.workers)
+        fetch_gfs(DataPaths(), FeatureConfig(), workers=args.workers, source=args.source, noaa=NoaaGfsConfig())
+    elif args.command == "gfs-compare":
+        from src.oibc.data.external_gfs import compare_gfs_sources, parse_init_id
+
+        inits = [parse_init_id(x) for x in args.inits] if args.inits else None
+        noaa_cfg = NoaaGfsConfig() if args.sample is None else NoaaGfsConfig(compare_sample=args.sample)
+        compare_gfs_sources(DataPaths(), FeatureConfig(), noaa_cfg, inits)
     elif args.command == "gfs-audit":  # pragma: no cover - 네트워크 수집
         from src.oibc.data.external_gfs import audit_publication
 

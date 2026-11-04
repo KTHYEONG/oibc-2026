@@ -142,12 +142,18 @@ uv run pytest                             # 테스트만
 
 uv run python -m src.oibc.pipeline ingest
 uv run python -m src.oibc.pipeline derive
+uv sync --group external                  # 외부 GFS 수집 의존성
+uv run python -m src.oibc.pipeline gfs-fetch      # dynamical.org GFS 상자 npz
+uv run python -m src.oibc.pipeline gfs-audit      # NOAA 원본 공개 시각 감사
+uv run python -m src.oibc.pipeline gfs-hourly     # 대상일 시간별 광역 요약
 uv run python -m src.oibc.pipeline features
 uv run python -m src.oibc.pipeline compose --comp-id <배정 이름>
 uv run python -m src.oibc.pipeline validate-run --run-id <이름> --hypothesis "<가설>"
 uv run python -m src.oibc.pipeline submit --run-id <이름> --sub-id <제출 이름>
 uv run python -m src.oibc.pipeline validate-submission --composition <composition.csv> --forecast <forecast.csv>
 ```
+
+dynamical.org 저장소를 쓸 수 없으면 `gfs-fetch --source noaa`로 NOAA 원본 GRIB(`noaa-gfs-bdp-pds`)에서 같은 형식의 파일을 만듭니다. 이미 있는 파일은 건드리지 않습니다. 대역폭은 init당 약 150MB이고, 전체 기간은 약 270GB입니다. 두 경로가 같은 특성을 만드는지는 `gfs-compare`(기본 표본 24개 init)로 확인합니다.
 
 ## 🤖 개발 과정에서의 AI 활용
 

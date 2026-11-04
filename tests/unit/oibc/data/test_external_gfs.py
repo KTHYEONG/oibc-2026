@@ -4,17 +4,25 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.oibc.config import CompetitionSpec, DataPaths, ExternalGfsConfig, FeatureConfig
+from src.oibc.config import CompetitionSpec, DataPaths, ExternalGfsConfig, FeatureConfig, NoaaGfsConfig
 from src.oibc.data.external_gfs import (
     ExternalError,
     add_derived,
+    assemble_noaa_arrays,
     audit_path,
     build_gfs_hourly,
+    compare_summaries,
+    crop_box,
     deaverage,
     gfs_dir,
     hourly_path,
     is_published_before_cutoff,
     last_used_lead,
+    noaa_fetch_leads,
+    noaa_pending_inits,
+    parse_idx,
+    parse_init_id,
+    select_message,
     summarize_init,
     target_window,
 )
@@ -237,3 +245,203 @@ def test_build_gfs_hourly_rejects_irregular_lead_axis(tmp_path: Path) -> None:
     np.savez_compressed(path, **data)
     with pytest.raises(ExternalError, match="lead axis"):
         build_gfs_hourly(paths, _SPEC, FeatureConfig(gfs=cfg))
+
+
+# --- NOAA 원본 예비 경로 ---
+
+_INIT = pd.Timestamp("2025-05-30 00:00", tz="UTC")
+
+
+def _noaa_ext() -> ExternalGfsConfig:
+    return _cfg(variables={"sw": ("sw_src", "avg6"), "t2m": ("t_src", "inst"), "pr": ("pr_src", "inst")})
+
+
+def _noaa_cfg(**kw: object) -> NoaaGfsConfig:
+    base: dict[str, object] = {
+        "fields": {
+            "sw_src": ("DSWRF", "surface", "ave", 0.0),
+            "t_src": ("TMP", "2 m above ground", "inst", -273.15),
+            "pr_src": ("PRATE", "surface", "ave", 0.0),
+        },
+        "hourly_from_ave": ("pr_src",),
+        "equiv_tol": {"sw": 2.0, "t2m": 0.05, "pr": 1e-5},
+    }
+    base.update(kw)
+    return NoaaGfsConfig.model_validate(base)
+
+
+def _raw(values: dict[str, np.ndarray], leads: np.ndarray) -> dict[str, dict[int, np.ndarray]]:
+    return {src: {int(lead): arr[int(lead)] for lead in leads} for src, arr in values.items()}
+
+
+def test_noaa_fetch_leads_00z_covers_deaverage_prev() -> None:
+    assert np.array_equal(noaa_fetch_leads(0), np.arange(15, 40))
+    for h in (6, 12, 18):
+        assert noaa_fetch_leads(h).min() >= 1 and np.all(np.diff(noaa_fetch_leads(h)) == 1)
+
+
+_IDX = "1:0:d=2025053000:DSWRF:surface:24-27 hour ave fcst:\n2:100:d=2025053000:DSWRF:surface:26-27 hour ave fcst:\n3:250:d=2025053000:TMP:2 m above ground:27 hour fcst:\n"
+
+
+def test_parse_idx_ranges_and_last_none() -> None:
+    recs = parse_idx(_IDX)
+    assert parse_idx("\n" + _IDX + "\n") == recs
+    assert recs == [
+        (0, 100, "DSWRF:surface:24-27 hour ave fcst"),
+        (100, 250, "DSWRF:surface:26-27 hour ave fcst"),
+        (250, None, "TMP:2 m above ground:27 hour fcst"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "garbage line\n", "1:x:d=2025053000:A:b:c:\n", "1:50:d=2025053000:A:b:c:\n2:50:d=2025053000:B:b:c:\n"],
+)
+def test_parse_idx_rejects_malformed_or_nonincreasing(text: str) -> None:
+    with pytest.raises(ExternalError, match="idx"):
+        parse_idx(text)
+
+
+def test_select_message_ave_requires_reset_window() -> None:
+    assert select_message(parse_idx(_IDX), "DSWRF", "surface", "ave", 27) == (0, 99)
+
+
+def test_select_message_inst_and_failures() -> None:
+    recs = parse_idx(_IDX + "4:400:d=2025053000:RH:2 m above ground:27 hour fcst:\n")
+    assert select_message(recs, "TMP", "2 m above ground", "inst", 27) == (250, 399)
+    with pytest.raises(ExternalError, match="0 match"):
+        select_message(recs, "TCDC", "entire atmosphere", "ave", 27)
+    dup = parse_idx(_IDX.replace("26-27", "24-27"))
+    with pytest.raises(ExternalError, match="2 match"):
+        select_message(dup, "DSWRF", "surface", "ave", 27)
+    with pytest.raises(ExternalError, match="last message"):
+        select_message(recs, "RH", "2 m above ground", "inst", 27)
+
+
+def test_crop_box_orders_north_to_south_and_validates_grid() -> None:
+    cfg = ExternalGfsConfig()
+    lat = np.arange(30.0, 42.0 + 1e-9, 0.25)  # 남→북 입력
+    lon = np.arange(120.0, 135.0 + 1e-9, 0.25)
+    values = lat[:, None] * 1000.0 + lon[None, :]
+    arr, la, lo = crop_box(values, lat, lon, cfg)
+    assert arr.shape == (31, 31) and la[0] == 39.5 and la[-1] == 32.0 and lo[0] == 124.0 and lo[-1] == 131.5
+    assert np.allclose(arr, la[:, None] * 1000.0 + lo[None, :])
+    lon360 = np.arange(0.0, 360.0, 0.25)
+    arr2, _, lo2 = crop_box(np.tile(lon360, (lat.size, 1)), lat, lon360, cfg)
+    assert np.allclose(lo2, np.arange(124.0, 131.5 + 1e-9, 0.25)) and np.allclose(arr2[0], lo2)
+    with pytest.raises(ExternalError, match=r"0\.25 deg"):
+        crop_box(values[:, ::2], lat, lon[::2], cfg)
+    bent = lat.copy()
+    bent[np.argmin(np.abs(lat - 35.0))] = 35.1
+    with pytest.raises(ExternalError, match=r"0\.25 deg"):
+        crop_box(values, bent, lon, cfg)
+    with pytest.raises(ExternalError, match="values shape"):
+        crop_box(values.T, lat, lon, cfg)
+
+
+def test_assemble_applies_offset_and_nan_outside_fetch_leads() -> None:
+    ext, noaa = _noaa_ext(), _noaa_cfg()
+    rng = np.random.default_rng(0)
+    vals = {k: rng.uniform(0, 300, (49, 4, 4)) for k in ("sw_src", "t_src", "pr_src")}
+    out = assemble_noaa_arrays(_raw(vals, noaa_fetch_leads(0)), _INIT, ext, noaa)
+    t = out["t_src"]
+    assert t.shape == (49, 4, 4) and t.dtype == np.float32
+    assert np.allclose(t[15:40], vals["t_src"][15:40] - 273.15, atol=1e-4)
+    assert np.isnan(t[:15]).all() and np.isnan(t[40:]).all()
+
+
+def test_assemble_precip_deaverage_recovers_hourly() -> None:
+    ext, noaa = _noaa_ext(), _noaa_cfg()
+    rng = np.random.default_rng(1)
+    hourly = rng.uniform(0, 1e-3, (49, 4, 4))
+    vals = {"sw_src": rng.uniform(0, 800, (49, 4, 4)), "t_src": rng.uniform(270, 300, (49, 4, 4)), "pr_src": _avg6_from_hourly(hourly)}
+    pr = assemble_noaa_arrays(_raw(vals, noaa_fetch_leads(0)), _INIT, ext, noaa)["pr_src"]
+    assert np.allclose(pr[16:40], hourly[16:40], rtol=1e-6, atol=1e-10)
+    assert np.isnan(pr[15]).all()
+
+
+def test_assemble_keeps_avg6_raw() -> None:
+    ext, noaa = _noaa_ext(), _noaa_cfg()
+    arrays, _ = _arrays(3)
+    rng = np.random.default_rng(3)
+    pr_hourly = rng.uniform(0, 1e-3, (49, _LAT.size, _LON.size))
+    raw_vals = {"sw_src": arrays["sw_src"], "t_src": arrays["t_src"] + 273.15, "pr_src": _avg6_from_hourly(pr_hourly)}
+    out = assemble_noaa_arrays(_raw(raw_vals, noaa_fetch_leads(0)), _INIT, ext, noaa)
+    assert np.allclose(out["sw_src"][15:40], arrays["sw_src"][15:40].astype("float32"))
+    dyn = {"sw_src": arrays["sw_src"], "t_src": arrays["t_src"], "pr_src": pr_hourly}
+    a = summarize_init(out, _LAT, _LON, _INIT, ext)
+    b = summarize_init(dyn, _LAT, _LON, _INIT, ext)
+    cols = [c for c in b.columns if c not in ("ts", "init")]
+    assert np.allclose(a[cols].to_numpy(dtype="float64"), b[cols].to_numpy(dtype="float64"), rtol=1e-4, atol=1e-6)
+
+
+def test_assemble_fails_closed_on_missing_var_or_lead() -> None:
+    ext, noaa = _noaa_ext(), _noaa_cfg()
+    vals = {k: np.ones((49, 2, 2)) for k in ("sw_src", "t_src", "pr_src")}
+    raw = _raw(vals, noaa_fetch_leads(0))
+    with pytest.raises(ExternalError, match="missing NOAA variable"):
+        assemble_noaa_arrays({k: v for k, v in raw.items() if k != "t_src"}, _INIT, ext, noaa)
+    with pytest.raises(ExternalError, match="no NOAA field mapping"):
+        assemble_noaa_arrays(raw, _INIT, ext, _noaa_cfg(fields={"sw_src": ("DSWRF", "surface", "ave", 0.0)}, hourly_from_ave=()))
+    with pytest.raises(ExternalError, match="max_lead_h"):
+        assemble_noaa_arrays(raw, _INIT, _noaa_ext().model_copy(update={"max_lead_h": 30}), noaa)
+    odd = {k: dict(v) for k, v in raw.items()}
+    odd["t_src"][20] = np.ones((3, 3))
+    with pytest.raises(ExternalError, match="inconsistent grid shape"):
+        assemble_noaa_arrays(odd, _INIT, ext, noaa)
+    del raw["sw_src"][27]
+    with pytest.raises(ExternalError, match="missing leads"):
+        assemble_noaa_arrays(raw, _INIT, ext, noaa)
+
+
+def _summary_pair() -> tuple[pd.DataFrame, pd.DataFrame]:
+    ts = pd.date_range("2025-05-31 01:00", periods=3, freq="h", tz=_KST)
+    base = pd.DataFrame({"ts": ts, "gfs00_sw_box": [100.0, 200.0, 300.0], "gfs00_sw_insd": [10.0, 20.0, 30.0]})
+    return base, base.copy()
+
+
+def test_compare_summaries_tolerance_and_insd_factor() -> None:
+    ext, noaa = _cfg(), _noaa_cfg()
+    a, b = _summary_pair()
+    b.loc[1, "gfs00_sw_box"] += 1.9
+    b.loc[1, "gfs00_sw_insd"] += 5.9  # 2.0 x 3.0 = 6.0 이내
+    res = compare_summaries(a, b, ext, noaa).set_index("column")
+    assert res["ok"].all() and res.loc["gfs00_sw_insd", "tol"] == pytest.approx(6.0)
+    b.loc[2, "gfs00_sw_box"] += 2.1
+    assert not compare_summaries(a, b, ext, noaa).set_index("column").loc["gfs00_sw_box", "ok"]
+    c, d = _summary_pair()
+    d.loc[0, "gfs00_sw_box"] = np.nan
+    assert not compare_summaries(c, d, ext, noaa).set_index("column").loc["gfs00_sw_box", "ok"]
+    e, f = _summary_pair()
+    f["ts"] = f["ts"] + pd.Timedelta(hours=1)
+    with pytest.raises(ExternalError, match="ts mismatch"):
+        compare_summaries(e, f, ext, noaa)
+    g, h = _summary_pair()
+    with pytest.raises(ExternalError, match="column mismatch"):
+        compare_summaries(g, h.drop(columns="gfs00_sw_insd"), ext, noaa)
+    with pytest.raises(ExternalError, match="no tolerance"):
+        compare_summaries(g.rename(columns={"gfs00_sw_box": "gfs00_lw_box"}), h.rename(columns={"gfs00_sw_box": "gfs00_lw_box"}), ext, noaa)
+
+
+def test_parse_init_id_contract() -> None:
+    assert parse_init_id("2025071000") == pd.Timestamp("2025-07-10 00:00", tz="UTC")
+    for bad in ("2025-07-10", "202507100", "2025133100"):
+        with pytest.raises(ExternalError, match="init id"):
+            parse_init_id(bad)
+
+
+def test_noaa_pending_inits_skips_complete_and_rejects_partial(tmp_path: Path) -> None:
+    cfg = _cfg()
+    paths = DataPaths(
+        raw_dir=tmp_path / "raw", canonical_dir=tmp_path / "canonical", derived_dir=tmp_path / "derived",
+        features_dir=tmp_path / "features", external_dir=tmp_path / "external",
+    )
+    d = gfs_dir(paths, 0)
+    d.mkdir(parents=True)
+    arrays, _ = _arrays(5)
+    np.savez_compressed(d / "2025052900.npz", lat=_LAT, lon=_LON, lead_h=np.arange(49, dtype="int16"), **arrays)
+    pending = noaa_pending_inits(paths, cfg, 0)
+    assert [f"{i:%Y%m%d%H}" for i in pending] == ["2025053000", "2025053100"]
+    np.savez_compressed(d / "2025053000.npz", lat=_LAT, lon=_LON, sw_src=arrays["sw_src"])
+    with pytest.raises(ExternalError, match="partial file"):
+        noaa_pending_inits(paths, cfg, 0)

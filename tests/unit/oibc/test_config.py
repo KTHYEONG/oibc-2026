@@ -3,7 +3,7 @@ import pytest
 from pathlib import Path
 from pydantic import ValidationError
 
-from src.oibc.config import ArtifactPaths, CompetitionSpec, ComposeConfig, DataPaths, ExternalGfsConfig, FeatureConfig, FoldSpec, ModelConfig, RegionalConfig, RunConfig, ValidationConfig, repo_root
+from src.oibc.config import ArtifactPaths, CompetitionSpec, ComposeConfig, DataPaths, ExternalGfsConfig, FeatureConfig, NoaaGfsConfig, FoldSpec, ModelConfig, RegionalConfig, RunConfig, ValidationConfig, repo_root
 
 
 def test_default_spec_self_consistent() -> None:
@@ -646,3 +646,20 @@ def test_drift_config_rejects_non_finite() -> None:
 
     with pytest.raises(ValueError, match="must be finite"):
         DriftConfig(dispersion_factor=float("inf"))
+
+
+def test_noaa_gfs_config_defaults_cover_external_variables() -> None:
+    noaa, ext = NoaaGfsConfig(), ExternalGfsConfig()
+    assert {src for src, _ in ext.variables.values()} <= set(noaa.fields)
+    assert set(noaa.equiv_tol) == set(ext.variables)
+
+
+def test_noaa_gfs_config_rejects_bad_hourly_from_ave_or_tol() -> None:
+    with pytest.raises(ValidationError, match="unknown field"):
+        NoaaGfsConfig(hourly_from_ave=("snow_depth",))
+    with pytest.raises(ValidationError, match="'ave' field"):
+        NoaaGfsConfig(hourly_from_ave=("temperature_2m",))
+    with pytest.raises(ValidationError, match="equiv_tol"):
+        NoaaGfsConfig(equiv_tol={"sw": 0.0})
+    with pytest.raises(ValidationError, match="equiv_tol"):
+        NoaaGfsConfig(equiv_tol={"sw": float("nan")})

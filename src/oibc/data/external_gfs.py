@@ -8,20 +8,25 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pandas as pd
 
-from src.oibc.config import CompetitionSpec, DataPaths, ExternalGfsConfig, FeatureConfig
+from src.oibc.config import CompetitionSpec, DataPaths, ExternalGfsConfig, FeatureConfig, NoaaGfsConfig, NoaaStat
 from src.oibc.timeaxis import op_date
 
 logger = logging.getLogger(__name__)
 
 _KST = "Asia/Seoul"
 _AUDIT_COLUMNS = ["init", "last_lead_h", "published_utc"]
+_GRID_DEG = 0.25  # NOAA `pgrb2.0p25` 제품 격자 간격
+_INIT_ID = re.compile(r"^\d{10}$")
+_GRIB_LOCK = threading.Lock()  # ecCodes 빌드가 스레드 안전하다는 보장이 없어 해독만 직렬화한다
 
 
 class ExternalError(ValueError):
@@ -192,11 +197,172 @@ def _require_eval_coverage(table: pd.DataFrame, spec: CompetitionSpec, cols: lis
         raise ExternalError("gfs hourly does not cover every evaluation hour")
 
 
+def noaa_fetch_leads(run_hour: int) -> np.ndarray:
+    """NOAA 원본에서 받을 리드: 대상일 리드와 평균 풀기에 필요한 직전 리드(00z는 15..39)."""
+    init = pd.Timestamp("2025-01-01", tz="UTC") + pd.Timedelta(hours=run_hour)
+    leads = target_window(init)[1]
+    return np.arange(int(leads.min()) - 1, int(leads.max()) + 1, dtype="int64")
+
+
+def parse_idx(text: str) -> list[tuple[int, int | None, str]]:
+    """NOAA `.idx`를 (시작 바이트, 다음 메시지 시작 또는 None, "VAR:LEVEL:STEP") 목록으로 바꾼다. 형식 위반 시 ExternalError."""
+    starts: list[int] = []
+    descs: list[str] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split(":")
+        if len(parts) < 6 or not parts[1].isdigit() or not parts[2].startswith("d="):
+            raise ExternalError(f"idx: malformed line {line!r}")
+        start = int(parts[1])
+        if starts and start <= starts[-1]:
+            raise ExternalError("idx: byte offsets must increase")
+        starts.append(start)
+        descs.append(":".join(parts[3:6]))
+    if not starts:
+        raise ExternalError("idx: empty")
+    ends: list[int | None] = [*starts[1:], None]
+    return list(zip(starts, ends, descs, strict=True))
+
+
+def select_message(
+    records: Sequence[tuple[int, int | None, str]], short: str, level: str, stat: NoaaStat, lead: int
+) -> tuple[int, int]:
+    """필드·리드에 맞는 메시지 하나의 포함 바이트 범위. ave는 6시간 리셋 창만 인정한다. 0개·복수·마지막 메시지면 ExternalError."""
+    step = f"{((lead - 1) // 6) * 6}-{lead} hour ave fcst" if stat == "ave" else f"{lead} hour fcst"
+    want = f"{short}:{level}:{step}"
+    hits = [(start, end) for start, end, desc in records if desc == want]
+    if len(hits) != 1:
+        raise ExternalError(f"idx: {len(hits)} match(es) for {want!r}")
+    start, end = hits[0]
+    if end is None:
+        raise ExternalError(f"idx: {want!r} is the last message (unbounded range)")
+    return start, end - 1
+
+
+def crop_box(
+    values: np.ndarray, lat: np.ndarray, lon: np.ndarray, cfg: ExternalGfsConfig
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """전구 2-D 필드를 고정 상자로 자른다(위도 북→남, 경도 서→동, float64). 기대 0.25° 격자와 다르면 ExternalError."""
+    lat = np.asarray(lat, dtype="float64")
+    lon = (np.asarray(lon, dtype="float64") + 180.0) % 360.0 - 180.0
+    values = np.asarray(values, dtype="float64")
+    if values.shape != (lat.size, lon.size):
+        raise ExternalError("crop_box: values shape must be (lat, lon)")
+    yi = np.where((lat >= cfg.box_lat[0]) & (lat <= cfg.box_lat[1]))[0]
+    xi = np.where((lon >= cfg.box_lon[0]) & (lon <= cfg.box_lon[1]))[0]
+    yi = yi[np.argsort(-lat[yi], kind="stable")]
+    xi = xi[np.argsort(lon[xi], kind="stable")]
+    exp_lat = np.round(np.arange(cfg.box_lat[1], cfg.box_lat[0] - _GRID_DEG / 2, -_GRID_DEG), 6)
+    exp_lon = np.round(np.arange(cfg.box_lon[0], cfg.box_lon[1] + _GRID_DEG / 2, _GRID_DEG), 6)
+    if yi.size != exp_lat.size or xi.size != exp_lon.size:
+        raise ExternalError("crop_box: grid does not match the expected 0.25 deg box")
+    if not (np.allclose(lat[yi], exp_lat) and np.allclose(lon[xi], exp_lon)):
+        raise ExternalError("crop_box: grid does not match the expected 0.25 deg box")
+    return values[np.ix_(yi, xi)], lat[yi], lon[xi]
+
+
+def assemble_noaa_arrays(
+    raw: Mapping[str, Mapping[int, np.ndarray]], init: pd.Timestamp, ext: ExternalGfsConfig, noaa: NoaaGfsConfig
+) -> dict[str, np.ndarray]:
+    """리드별 상자 배열을 dynamical npz와 같은 (max_lead_h+1, ny, nx) float32로 조립한다. 받지 않은 리드는 NaN, 누락은 ExternalError."""
+    fetch = noaa_fetch_leads(init.hour)
+    if int(fetch.max()) > ext.max_lead_h:
+        raise ExternalError("max_lead_h is shorter than the fetch leads")
+    used = target_window(init)[1]
+    shape: tuple[int, ...] | None = None
+    out: dict[str, np.ndarray] = {}
+    for src, _kind in ext.variables.values():
+        if src not in noaa.fields:
+            raise ExternalError(f"no NOAA field mapping for {src!r}")
+        by_lead = raw.get(src)
+        if by_lead is None:
+            raise ExternalError(f"init {init:%Y%m%d%H}: missing NOAA variable {src!r}")
+        missing = [int(lead) for lead in fetch if int(lead) not in by_lead]
+        if missing:
+            raise ExternalError(f"init {init:%Y%m%d%H}: {src!r} missing leads {missing}")
+        offset = noaa.fields[src][3]
+        arr: np.ndarray | None = None
+        for lead in fetch:
+            grid = np.asarray(by_lead[int(lead)], dtype="float64")
+            if shape is None:
+                shape = grid.shape
+            if grid.ndim != 2 or grid.shape != shape:
+                raise ExternalError(f"init {init:%Y%m%d%H}: inconsistent grid shape for {src!r}")
+            if arr is None:
+                arr = np.full((ext.max_lead_h + 1, *shape), np.nan)
+            arr[int(lead)] = grid + offset
+        assert arr is not None
+        if src in noaa.hourly_from_ave:
+            hourly = np.full_like(arr, np.nan)
+            hourly[used] = deaverage(arr, used, init.hour)
+            arr = hourly
+        out[src] = arr.astype("float32")
+    return out
+
+
+def compare_summaries(
+    noaa: pd.DataFrame, dyn: pd.DataFrame, ext: ExternalGfsConfig, noaa_cfg: NoaaGfsConfig
+) -> pd.DataFrame:
+    """두 `summarize_init` 출력의 열별 최대 |차이|와 허용오차 판정(column, max_abs_diff, tol, ok). ts·열 불일치는 ExternalError."""
+    if not noaa["ts"].reset_index(drop=True).equals(dyn["ts"].reset_index(drop=True)):
+        raise ExternalError("compare: ts mismatch")
+    cols = [c for c in dyn.columns if c not in ("ts", "init")]
+    if set(cols) != {c for c in noaa.columns if c not in ("ts", "init")}:
+        raise ExternalError("compare: column mismatch")
+    rows: list[dict[str, object]] = []
+    for col in cols:
+        head, stat = col.rsplit("_", 1)
+        name = head.split("_", 1)[1]
+        if name not in noaa_cfg.equiv_tol or name not in ext.variables:
+            raise ExternalError(f"compare: no tolerance for {col!r}")
+        tol = noaa_cfg.equiv_tol[name] * (noaa_cfg.insd_tol_factor if stat == "insd" else 1.0)
+        a = noaa[col].to_numpy(dtype="float64")
+        b = dyn[col].to_numpy(dtype="float64")
+        na, nb = np.isnan(a), np.isnan(b)
+        both = ~na & ~nb
+        diff = float(np.abs(a[both] - b[both]).max()) if both.any() else 0.0
+        ok = bool(not (na ^ nb).any() and diff <= tol)
+        rows.append({"column": col, "max_abs_diff": diff, "tol": tol, "ok": ok})
+    return pd.DataFrame(rows, columns=["column", "max_abs_diff", "tol", "ok"])
+
+
+def noaa_pending_inits(paths: DataPaths, ext: ExternalGfsConfig, run_hour: int) -> list[pd.Timestamp]:
+    """npz 파일이 없는 기대 init만 반환한다. 변수가 빠진 기존 파일은 원천 혼합을 막기 위해 ExternalError."""
+    need = {src for src, _ in ext.variables.values()}
+    pending: list[pd.Timestamp] = []
+    for init in _expected_inits(ext, run_hour):
+        path = gfs_dir(paths, run_hour) / f"{init:%Y%m%d%H}.npz"
+        if not path.exists():
+            pending.append(init)
+        elif not need <= _npz_variables(path):
+            raise ExternalError(f"{path.name}: partial file (missing variables); refusing to mix sources")
+    return pending
+
+
+def parse_init_id(value: str) -> pd.Timestamp:
+    """`YYYYMMDDHH`(UTC) 문자열을 tz-aware UTC init으로 바꾼다. 형식 위반 시 ExternalError."""
+    if not _INIT_ID.match(value):
+        raise ExternalError(f"init id must be YYYYMMDDHH: {value!r}")
+    try:
+        return pd.Timestamp(f"{value[:8]} {value[8:]}:00", tz="UTC")
+    except ValueError as exc:
+        raise ExternalError(f"invalid init id {value!r}") from exc
+
+
 # --- 네트워크 수집(재현 절차). 단위 테스트 대상 아님 ---
 
 
-def fetch_gfs(paths: DataPaths, features: FeatureConfig, workers: int = 16) -> int:  # pragma: no cover
-    """dynamical.org GFS(CC-BY-4.0)에서 상자·리드 0~max_lead_h를 init별 npz로 받는다. 없는 변수만 받아 병합한다."""
+def fetch_gfs(
+    paths: DataPaths,
+    features: FeatureConfig,
+    workers: int = 16,
+    source: Literal["dynamical", "noaa"] = "dynamical",
+    noaa: NoaaGfsConfig | None = None,
+) -> int:  # pragma: no cover
+    """GFS 상자 npz를 init별로 받는다. dynamical(CC-BY-4.0)은 없는 변수만 병합하고, noaa(원본 GRIB)는 파일이 없는 init만 새로 쓴다."""
+    if source == "noaa":
+        return _fetch_gfs_noaa(paths, features.gfs, noaa or NoaaGfsConfig(), workers)
     from multiprocessing import Pool
 
     cfg = features.gfs
@@ -261,7 +427,7 @@ def audit_publication(paths: DataPaths, features: FeatureConfig, workers: int = 
     return out
 
 
-def _npz_variables(path: Path) -> set[str]:  # pragma: no cover
+def _npz_variables(path: Path) -> set[str]:
     if not path.exists():
         return set()
     with np.load(path) as z:
@@ -313,3 +479,151 @@ def _worker_fetch(job: tuple[int, pd.Timestamp, Iterable[str]]) -> str | None:  
             err = exc
             time.sleep(5 * (attempt + 1))
     return f"{init:%Y%m%d%H}: {err!r}"
+
+
+def _http_get(url: str, byte_range: tuple[int, int] | None = None, retries: int = 6) -> bytes:  # pragma: no cover
+    import urllib.error
+    import urllib.request
+
+    if not url.startswith("https://"):
+        raise ExternalError("only https sources are allowed")
+    headers = {"Range": f"bytes={byte_range[0]}-{byte_range[1]}"} if byte_range else {}
+    err: Exception | None = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers=headers)  # noqa: S310 - 위에서 https만 허용
+            with urllib.request.urlopen(req, timeout=120) as resp:  # noqa: S310 - https만 허용
+                body: bytes = resp.read()
+            if byte_range and len(body) != byte_range[1] - byte_range[0] + 1:
+                raise ExternalError(f"short range read for {url}")
+            return body
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise ExternalError(f"not found: {url}") from exc
+            err = exc
+        except (OSError, ExternalError) as exc:
+            err = exc
+        time.sleep(min(60.0, 2.0**attempt))
+    raise ExternalError(f"request failed after {retries} tries: {url}: {err!r}")
+
+
+def _decode_grib(message: bytes) -> tuple[np.ndarray, np.ndarray, np.ndarray]:  # pragma: no cover
+    import eccodes
+
+    with _GRIB_LOCK:
+        handle = eccodes.codes_new_from_message(message)
+        try:
+            ni, nj = eccodes.codes_get(handle, "Ni"), eccodes.codes_get(handle, "Nj")
+            lat0 = eccodes.codes_get(handle, "latitudeOfFirstGridPointInDegrees")
+            lon0 = eccodes.codes_get(handle, "longitudeOfFirstGridPointInDegrees")
+            dlat = eccodes.codes_get(handle, "jDirectionIncrementInDegrees")
+            dlon = eccodes.codes_get(handle, "iDirectionIncrementInDegrees")
+            if eccodes.codes_get(handle, "iScansNegatively") != 0:
+                raise ExternalError("unexpected GRIB scan order")
+            north_to_south = eccodes.codes_get(handle, "jScansPositively") == 0
+            values = np.asarray(eccodes.codes_get_values(handle), dtype="float64").reshape(nj, ni)
+        finally:
+            eccodes.codes_release(handle)
+    lat = lat0 - dlat * np.arange(nj) if north_to_south else lat0 + dlat * np.arange(nj)
+    lon = lon0 + dlon * np.arange(ni)
+    return values, lat, lon
+
+
+def noaa_init_arrays(
+    init: pd.Timestamp, ext: ExternalGfsConfig, noaa: NoaaGfsConfig
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]:  # pragma: no cover
+    """NOAA 원본 GRIB에서 init 하나를 받아 dynamical npz와 같은 변수 배열과 상자 위경도를 반환한다."""
+    sources = [src for src, _ in ext.variables.values()]
+    raw: dict[str, dict[int, np.ndarray]] = {src: {} for src in sources}
+    lat_box = lon_box = np.empty(0)
+    for lead in noaa_fetch_leads(init.hour):
+        stem = f"{ext.noaa_bucket_url}/gfs.{init:%Y%m%d}/{init:%H}/atmos/gfs.t{init:%H}z.pgrb2.0p25.f{int(lead):03d}"
+        records = parse_idx(_http_get(stem + ".idx").decode())
+        for src in sources:
+            short, level, stat, _offset = noaa.fields[src]
+            values, lat, lon = _decode_grib(_http_get(stem, select_message(records, short, level, stat, int(lead))))
+            raw[src][int(lead)], lat_box, lon_box = crop_box(values, lat, lon, ext)
+    return assemble_noaa_arrays(raw, init, ext, noaa), lat_box, lon_box
+
+
+def _fetch_gfs_noaa(paths: DataPaths, ext: ExternalGfsConfig, noaa: NoaaGfsConfig, workers: int) -> int:  # pragma: no cover
+    from concurrent.futures import ThreadPoolExecutor
+
+    pending = [(h, init) for h in ext.run_hours for init in noaa_pending_inits(paths, ext, h)]
+    logger.info("[DATA] gfs noaa fetch pending=%d workers=%d", len(pending), workers)
+    if not pending:
+        return 0
+
+    def one(job: tuple[int, pd.Timestamp]) -> str | None:
+        h, init = job
+        try:
+            arrays, lat, lon = noaa_init_arrays(init, ext, noaa)
+            path = gfs_dir(paths, h) / f"{init:%Y%m%d%H}.npz"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp.npz")
+            payload = {"lead_h": np.arange(ext.max_lead_h + 1, dtype="int16"), "lat": lat, "lon": lon, **arrays}
+            np.savez_compressed(tmp, **payload)  # type: ignore[arg-type]  # numpy 스텁이 allow_pickle 키와 충돌
+            os.replace(tmp, path)
+            return None
+        except Exception as exc:  # init 단위 실패는 모아서 보고하고 재실행으로 이어받는다
+            return f"{init:%Y%m%d%H}: {exc!r}"
+
+    t0 = time.perf_counter()
+    fails = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for k, err in enumerate(ex.map(one, pending), start=1):
+            if err:
+                fails += 1
+                logger.error("[DATA] gfs noaa fetch failed %s", err)
+            if k % 50 == 0 or k == len(pending):
+                logger.info("[DATA] gfs noaa fetched=%d/%d fails=%d sec=%.0f", k, len(pending), fails, time.perf_counter() - t0)
+    if fails:
+        raise ExternalError(f"gfs noaa fetch: {fails} init(s) failed; rerun to resume")
+    return len(pending)
+
+
+def compare_gfs_sources(
+    paths: DataPaths,
+    features: FeatureConfig,
+    noaa: NoaaGfsConfig,
+    inits: Sequence[pd.Timestamp] | None = None,
+    workers: int = 8,
+) -> Path:  # pragma: no cover
+    """표본 init을 NOAA 원본(메모리)과 기존 npz로 각각 요약해 비교하고 `noaa_equiv.csv`를 쓴다. 허용오차 초과 시 ExternalError."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    ext = features.gfs
+    if inits is None:
+        candidates = [i for h in ext.run_hours for i in _expected_inits(ext, h)]
+        rng = np.random.default_rng(noaa.compare_seed)
+        pick = np.sort(rng.choice(len(candidates), size=min(noaa.compare_sample, len(candidates)), replace=False))
+        inits = [candidates[int(i)] for i in pick]
+    for init in inits:
+        if not (gfs_dir(paths, init.hour) / f"{init:%Y%m%d%H}.npz").exists():
+            raise ExternalError(f"compare: no existing npz for {init:%Y%m%d%H}")
+    logger.info("[DATA] gfs compare inits=%d workers=%d", len(inits), workers)
+
+    def one(init: pd.Timestamp) -> pd.DataFrame:
+        arrays, lat, lon = noaa_init_arrays(init, ext, noaa)
+        with np.load(gfs_dir(paths, init.hour) / f"{init:%Y%m%d%H}.npz") as z:
+            dyn_arrays = {src: z[src] for src, _ in ext.variables.values()}
+            dyn_lat, dyn_lon = z["lat"], z["lon"]
+        if not (np.allclose(lat, dyn_lat) and np.allclose(lon, dyn_lon)):
+            raise ExternalError(f"compare: grid mismatch for {init:%Y%m%d%H}")
+        table = compare_summaries(
+            summarize_init(arrays, lat, lon, init, ext), summarize_init(dyn_arrays, dyn_lat, dyn_lon, init, ext), ext, noaa
+        )
+        table.insert(0, "init", f"{init:%Y%m%d%H}")
+        return table
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        report = pd.concat(list(ex.map(one, inits)), ignore_index=True)
+    out = paths.external_dir / "gfs" / "noaa_equiv.csv"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    report.to_csv(out, index=False)
+    worst = report.groupby("column")["max_abs_diff"].max()
+    logger.info("[DATA] gfs compare rows=%d fails=%d -> %s", len(report), int((~report["ok"]).sum()), out)
+    logger.info("[DATA] gfs compare worst %s", " ".join(f"{c}={v:.3g}" for c, v in worst.items()))
+    if not report["ok"].all():
+        raise ExternalError(f"gfs compare: {int((~report['ok']).sum())} column(s) exceed tolerance; see {out}")
+    return out

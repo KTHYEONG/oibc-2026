@@ -1143,3 +1143,28 @@ def test_gfs_hourly_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gfs_mod, "build_gfs_hourly", lambda *args: calls.append(args))
     assert main(["gfs-hourly"]) == 0
     assert len(calls) == 1
+
+
+def test_gfs_fetch_source_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.data.external_gfs as gfs_mod
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(gfs_mod, "fetch_gfs", lambda *args, **kw: calls.append(kw))
+    assert main(["gfs-fetch", "--source", "noaa"]) == 0
+    assert main(["gfs-fetch"]) == 0
+    assert [c["source"] for c in calls] == ["noaa", "dynamical"]
+
+
+def test_gfs_compare_dispatch_parses_inits(monkeypatch: pytest.MonkeyPatch) -> None:
+    import pandas as pd
+
+    import src.oibc.data.external_gfs as gfs_mod
+
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(gfs_mod, "compare_gfs_sources", lambda *args: calls.append(args))
+    assert main(["gfs-compare", "--inits", "2025071000"]) == 0
+    assert calls[0][3] == [pd.Timestamp("2025-07-10 00:00", tz="UTC")]
+    assert main(["gfs-compare", "--sample", "5"]) == 0
+    assert calls[1][3] is None and calls[1][2].compare_sample == 5
+    with pytest.raises(gfs_mod.ExternalError, match="YYYYMMDDHH"):
+        main(["gfs-compare", "--inits", "2025-07-10"])

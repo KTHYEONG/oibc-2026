@@ -1095,10 +1095,45 @@ def test_scale_submission_keeps_base_note_and_rejects_missing_base(tmp_path: Pat
 
 
 def test_scale_submission_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, float, str]] = []
-    monkeypatch.setattr("src.oibc.pipeline.scale_submission", lambda base, s, sid: calls.append((base, s, sid)))
+    calls: list[tuple[str, float, str, tuple[int, ...] | None]] = []
+    monkeypatch.setattr(
+        "src.oibc.pipeline.scale_submission",
+        lambda base, s, sid, *, months=None: calls.append((base, s, sid, months)),
+    )
     assert main(["scale-submission", "--base-sub", "b", "--scale", "0.98", "--sub-id", "s"]) == 0
-    assert calls == [("b", 0.98, "s")]
+    assert main(["scale-submission", "--base-sub", "b", "--scale", "0.97", "--sub-id", "w", "--months", "11", "12", "1", "2"]) == 0
+    assert calls == [("b", 0.98, "s", None), ("b", 0.97, "w", (11, 12, 1, 2))]
+
+
+def test_scale_submission_months_follow_right_closed_operating_day(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.oibc.config as config_mod
+    import src.oibc.submit.build as build_mod
+    from src.oibc.pipeline import scale_submission
+
+    root = tmp_path / "submissions"
+    root.mkdir()
+    paths = config_mod.ArtifactPaths(submissions=root)
+    monkeypatch.setattr(config_mod, "ArtifactPaths", lambda *a, **k: paths)
+    # 2026-03-01 00:00은 2월 운영일의 마지막 시각, 01:00부터 3월 운영일이다.
+    _write_sub(root, "base", "base-run", "a" * 64, 100.0, ["2026-03-01T00:00:00+09:00", "2026-03-01T01:00:00+09:00"])
+    calls: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: calls.append((a, k)))
+    scale_submission("base", 0.97, "winter", months=(11, 12, 1, 2))
+    (_, forecast, _), kwargs = calls[0]
+    by_ts = forecast.set_index(forecast["ts"].dt.strftime("%Y-%m-%d %H:%M"))["forecast_kwh"]
+    np.testing.assert_allclose(by_ts.loc["2026-03-01 00:00"].to_numpy(), 97.0, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(by_ts.loc["2026-03-01 01:00"].to_numpy(), 100.0, rtol=0, atol=0)
+    assert kwargs["note"] == "level-scale base=base scale=0.97 months=11,12,1,2"
+
+
+@pytest.mark.parametrize("months", [(), (0,), (13,), (1, 1)])
+def test_scale_submission_rejects_invalid_months(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, months: tuple[int, ...]) -> None:
+    from src.oibc.pipeline import scale_submission
+    from src.oibc.train.runner import RunnerError
+
+    _scale_env(tmp_path, monkeypatch)
+    with pytest.raises(RunnerError, match="months must be"):
+        scale_submission("base", 0.97, "scaled", months=months)
 
 
 def test_gfs_hourly_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:

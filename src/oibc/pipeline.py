@@ -86,6 +86,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     scale_cmd.add_argument("--base-sub", required=True)
     scale_cmd.add_argument("--scale", type=float, required=True)
     scale_cmd.add_argument("--sub-id", required=True)
+    scale_cmd.add_argument("--months", nargs="+", type=int, choices=range(1, 13), default=None)
     rc = sub.add_parser("report-calibration")
     rc.add_argument("--run-id", required=True)
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -275,7 +276,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "splice-submission":
         splice_submission(args.base_sub, args.fallback_sub, args.sub_id)
     elif args.command == "scale-submission":
-        scale_submission(args.base_sub, args.scale, args.sub_id)
+        months = tuple(args.months) if args.months else None
+        scale_submission(args.base_sub, args.scale, args.sub_id, months=months)
     elif args.command == "report-netting":
         import json
 
@@ -370,17 +372,31 @@ def _read_submission(name: str, label: str) -> tuple[SubmissionManifest, pd.Data
     return manifest, comp, fc
 
 
-def scale_submission(base_sub: str, scale: float, sub_id: str) -> Path:
-    """base 제출의 모든 예측에 scale을 곱한 수준 헤지 제출을 만든다. scale이 (0, 2] 밖이거나 계약 위반이면 RunnerError."""
+def scale_submission(base_sub: str, scale: float, sub_id: str, *, months: tuple[int, ...] | None = None) -> Path:
+    """base 제출 예측에 scale을 곱한 수준 보정 제출을 만든다. months가 있으면 운영일(right-closed) 월이 그 안인 행만 곱한다.
+
+    scale이 (0, 2] 밖이거나 months가 비었거나 1~12 밖·중복이면, 또는 계약 위반이면 RunnerError.
+    """
+    import numpy as np
+
     from src.oibc.submit.build import write_submission
+    from src.oibc.timeaxis import op_date
     from src.oibc.train.runner import RunnerError
 
     if not (math.isfinite(scale) and 0.0 < scale <= 2.0):
         raise RunnerError("scale: scale must be finite and in (0, 2]")
+    if months is not None and (not months or len(set(months)) != len(months) or any(not 1 <= m <= 12 for m in months)):
+        raise RunnerError("scale: months must be non-empty, distinct, and in 1..12")
     base_m, base_comp, base_fc = _read_submission(base_sub, "scale")
+    values = base_fc["forecast_kwh"].to_numpy(dtype="float64")
     scaled = base_fc[["group", "ts"]].copy()
-    scaled["forecast_kwh"] = base_fc["forecast_kwh"].to_numpy(dtype="float64") * scale
-    note = f"level-scale base={base_sub} scale={scale!r}"
+    if months is None:
+        scaled["forecast_kwh"] = values * scale
+        note = f"level-scale base={base_sub} scale={scale!r}"
+    else:
+        hit = op_date(base_fc["ts"]).dt.month.isin(months).to_numpy()
+        scaled["forecast_kwh"] = np.where(hit, values * scale, values)
+        note = f"level-scale base={base_sub} scale={scale!r} months={','.join(map(str, months))}"
     if base_m.note:
         note = f"{note}; base_note={base_m.note}"
     logger.info("[SUBMIT] scale base=%s scale=%r rows=%d", base_sub, scale, len(scaled))

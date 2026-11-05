@@ -59,6 +59,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     ec_fetch.add_argument("--workers", type=int, default=8)
     ec_audit = sub.add_parser("ecmwf-audit")
     ec_audit.add_argument("--workers", type=int, default=8)
+    ec_equiv = sub.add_parser("ecmwf-equiv")
+    ec_equiv.add_argument("--workers", type=int, default=6)
     ec_corr = sub.add_parser("ecmwf-correct")
     ec_corr.add_argument("--base-sub", required=True)
     ec_corr.add_argument("--sub-id", required=True)
@@ -139,6 +141,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         from src.oibc.data.external_ecmwf import audit_ecmwf
 
         audit_ecmwf(DataPaths(), EcmwfConfig(), workers=args.workers)
+    elif args.command == "ecmwf-equiv":  # pragma: no cover - 네트워크 목록 대조
+        from src.oibc.data.external_ecmwf import audit_mirror
+
+        audit_mirror(DataPaths(), EcmwfConfig(), workers=args.workers)
     elif args.command == "ecmwf-correct":
         ecmwf_correct_submission(args.base_sub, args.sub_id)
     elif args.command == "validate-submission":

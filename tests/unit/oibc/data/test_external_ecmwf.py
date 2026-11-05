@@ -10,16 +10,21 @@ from src.oibc.data.external_ecmwf import (
     block_index,
     block_leads,
     block_means,
+    compare_mirror,
     correction_multiplier,
     ec_blocks,
     fit_beta,
     fit_frame,
     gfs_blocks,
     is_before_cutoff,
+    mirror_equiv_path,
+    mirror_keys,
     needed_leads,
+    parse_listing,
     read_audit,
     run_dir,
     run_init,
+    run_prefix,
     x_table,
 )
 from src.oibc.data.external_gfs import ExternalError
@@ -227,3 +232,49 @@ def test_ec_blocks_falls_back_when_run_file_is_incomplete(tmp_path: Path) -> Non
     _write_run(paths, "18z", "2025-03-02", 200.0, "2025-03-01T01:27:00+00:00")
     _write_run(paths, "12z", "2025-03-02", 300.0, "2025-02-28T20:34:00+00:00")
     assert set(ec_blocks(paths, cfg, CompetitionSpec())["src"]) == {"18z"}
+
+
+_S3_XML = (
+    "<ListBucketResult><IsTruncated>false</IsTruncated>"
+    "<Contents><Key>a.grib2</Key><LastModified>2025-03-01T08:34:06.000Z</LastModified>"
+    "<ETag>&quot;1a8f&quot;</ETag><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm><Size>10</Size></Contents>"
+    "<Contents><Key>a.index</Key><LastModified>2025-03-01T08:34:07.000Z</LastModified>"
+    "<ETag>&quot;e741&quot;</ETag><Size>3</Size></Contents></ListBucketResult>"
+)
+_GCS_XML = (
+    "<ListBucketResult><Contents><Key>a.grib2</Key><Generation>1</Generation><MetaGeneration>1</MetaGeneration>"
+    '<LastModified>2025-03-01T08:34:28.607Z</LastModified><ETag>"1a8f"</ETag><Size>10</Size></Contents></ListBucketResult>'
+)
+
+
+def test_parse_listing_reads_s3_and_gcs_formats() -> None:
+    s3, gcs = parse_listing(_S3_XML), parse_listing(_GCS_XML)
+    assert s3 == {"a.grib2": ("2025-03-01T08:34:06.000Z", "1a8f", 10), "a.index": ("2025-03-01T08:34:07.000Z", "e741", 3)}
+    assert gcs == {"a.grib2": ("2025-03-01T08:34:28.607Z", "1a8f", 10)}
+    assert parse_listing("<ListBucketResult></ListBucketResult>") == {}
+
+
+def test_parse_listing_fails_closed_on_incomplete_entry() -> None:
+    with pytest.raises(ExternalError, match="missing"):
+        parse_listing("<Contents><Key>a</Key><Size>1</Size></Contents>")
+
+
+def test_mirror_keys_cover_needed_leads_for_run_init() -> None:
+    run, day = RUNS["00z"], pd.Timestamp("2025-03-02")
+    keys = mirror_keys(run, day, CFG)
+    assert run_prefix(run, day, CFG) == "20250301/00z/ifs/0p25/oper/20250301000000-"
+    assert len(keys) == 2 * len(needed_leads(run, CFG))
+    assert keys[0] == f"20250301/00z/ifs/0p25/oper/20250301000000-{needed_leads(run, CFG)[0]}h-oper-fc.grib2"
+    assert all(k.endswith((".grib2", ".index")) for k in keys)
+
+
+def test_compare_mirror_matches_only_identical_files_present_in_both(tmp_path: Path) -> None:
+    run, day = RUNS["18z"], pd.Timestamp("2024-09-19")
+    origin = {"k1": ("t0", "m1", 10), "k2": ("t0", "m2", 10), "k3": ("t0", "m3", 5)}
+    mirror = {"k1": ("t1", "m1", 10), "k2": ("t1", "zz", 10), "k3": ("t1", "m3", 6)}
+    rows = {r["key"]: r for r in compare_mirror(run, day, ["k1", "k2", "k3", "k4"], origin, mirror)}
+    assert [rows[k]["match"] for k in ("k1", "k2", "k3", "k4")] == [True, False, False, False]
+    assert rows["k4"]["origin_md5"] == "" and rows["k4"]["mirror_size"] is None
+    assert rows["k1"]["run"] == "18z" and rows["k1"]["target_date"] == "2024-09-19"
+    assert rows["k1"]["origin_lastmod"] == "t0" and rows["k1"]["mirror_lastmod"] == "t1"
+    assert mirror_equiv_path(DataPaths(external_dir=tmp_path)) == tmp_path / "ecmwf" / "mirror_equiv.csv"

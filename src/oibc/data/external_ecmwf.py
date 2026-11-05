@@ -223,6 +223,83 @@ def fit_frame(group_oof: pd.DataFrame, weights: pd.Series, xt: pd.DataFrame, cfg
     return h[h["op"] >= pd.Timestamp(cfg.target_start)].reset_index(drop=True)
 
 
+# ---- 미러 동등성 ----
+
+_EQUIV_COLUMNS = [
+    "run",
+    "target_date",
+    "key",
+    "origin_lastmod",
+    "origin_md5",
+    "origin_size",
+    "mirror_lastmod",
+    "mirror_md5",
+    "mirror_size",
+    "match",
+]
+_FIELD = {name: re.compile(rf"<{name}>([^<]*)</{name}>") for name in ("Key", "LastModified", "ETag", "Size")}
+
+
+def mirror_equiv_path(paths: DataPaths) -> Path:
+    """원본·미러 파일 동등성 대조 CSV 경로."""
+    return paths.external_dir / "ecmwf" / "mirror_equiv.csv"
+
+
+def run_prefix(run: EcmwfRunSpec, day: pd.Timestamp, cfg: EcmwfConfig) -> str:
+    """대상일 실행 파일들의 버킷 공통 접두어."""
+    init = run_init(day, run)
+    return f"{init:%Y%m%d}/{init:%H}z/ifs/{cfg.resolution}/{run.stream}/{init:%Y%m%d%H}0000-"
+
+
+def mirror_keys(run: EcmwfRunSpec, day: pd.Timestamp, cfg: EcmwfConfig) -> list[str]:
+    """대상일 보정에 쓰는 리드별 grib2·index 파일 키."""
+    prefix = run_prefix(run, day, cfg)
+    return [f"{prefix}{lead}h-{run.stream}-fc.{ext}" for lead in needed_leads(run, cfg) for ext in ("grib2", "index")]
+
+
+def parse_listing(xml: str) -> dict[str, tuple[str, str, int]]:
+    """S3·GCS 목록 XML에서 키별 (LastModified, MD5 ETag, 크기)를 읽는다. 필드가 빠진 항목은 ExternalError."""
+    import html
+
+    out: dict[str, tuple[str, str, int]] = {}
+    for block in xml.split("<Contents>")[1:]:
+        found = {name: pat.search(block) for name, pat in _FIELD.items()}
+        missing = [name for name, m in found.items() if m is None]
+        if missing:
+            raise ExternalError(f"listing entry missing {missing}")
+        key, lastmod, etag, size = (found[n].group(1) for n in ("Key", "LastModified", "ETag", "Size"))  # type: ignore[union-attr]
+        out[html.unescape(key)] = (lastmod, html.unescape(etag).strip('"'), int(size))
+    return out
+
+
+def compare_mirror(
+    run: EcmwfRunSpec,
+    day: pd.Timestamp,
+    keys: Sequence[str],
+    origin: Mapping[str, tuple[str, str, int]],
+    mirror: Mapping[str, tuple[str, str, int]],
+) -> list[dict[str, Any]]:
+    """키마다 원본·미러 메타데이터를 나란히 두고, 둘 다 있고 MD5·크기가 같을 때만 match=True."""
+    rows = []
+    for key in keys:
+        a, b = origin.get(key), mirror.get(key)
+        rows.append(
+            {
+                "run": run.name,
+                "target_date": f"{day:%Y-%m-%d}",
+                "key": key,
+                "origin_lastmod": a[0] if a else "",
+                "origin_md5": a[1] if a else "",
+                "origin_size": a[2] if a else None,
+                "mirror_lastmod": b[0] if b else "",
+                "mirror_md5": b[1] if b else "",
+                "mirror_size": b[2] if b else None,
+                "match": bool(a and b and a[1] == b[1] and a[2] == b[2]),
+            }
+        )
+    return rows
+
+
 # ---- 수집·감사(네트워크) ----
 
 
@@ -359,3 +436,48 @@ def audit_ecmwf(paths: DataPaths, cfg: EcmwfConfig, workers: int = 8) -> list[Pa
         )
         out.append(path)
     return out
+
+
+def _list_files(base: str, prefix: str) -> dict[str, tuple[str, str, int]]:  # pragma: no cover
+    out: dict[str, tuple[str, str, int]] = {}
+    token = ""
+    while True:
+        if "amazonaws" in base:
+            url = f"{base}/?list-type=2&max-keys=1000&prefix={prefix}" + (f"&continuation-token={token}" if token else "")
+        else:
+            url = f"{base}?prefix={prefix}" + (f"&marker={token}" if token else "")
+        text = _get(url).decode()
+        page = parse_listing(text)
+        out.update(page)
+        if "<IsTruncated>true</IsTruncated>" not in text:
+            return out
+        nxt = re.search(r"<Next(?:ContinuationToken|Marker)>([^<]*)</Next", text)
+        token = nxt.group(1) if nxt else max(page)
+
+
+def audit_mirror(paths: DataPaths, cfg: EcmwfConfig, workers: int = 6) -> Path:  # pragma: no cover
+    """실행·대상일마다 사용 파일의 원본(S3)·미러(GCS) MD5·크기·LastModified를 목록 API로 대조해 CSV로 남긴다(덮어씀)."""
+
+    def one(job: tuple[EcmwfRunSpec, pd.Timestamp]) -> list[dict[str, Any]]:
+        run, day = job
+        prefix = run_prefix(run, day, cfg)
+        origin, mirror = _list_files(cfg.s3_url, prefix), _list_files(cfg.mirror_url, prefix)
+        return compare_mirror(run, day, mirror_keys(run, day, cfg), origin, mirror)
+
+    jobs = [(run, day) for run in cfg.runs for day in target_dates(cfg)]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        frame = pd.DataFrame([row for rows in pool.map(one, jobs) for row in rows], columns=_EQUIV_COLUMNS)
+    path = mirror_equiv_path(paths)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(path, index=False)
+    both = (frame["origin_md5"] != "") & (frame["mirror_md5"] != "")
+    logger.info(
+        "[DATA] ecmwf mirror equiv files=%d both=%d match=%d mismatch=%d origin_only=%d mirror_only=%d",
+        len(frame),
+        int(both.sum()),
+        int(frame["match"].sum()),
+        int((both & ~frame["match"]).sum()),
+        int(((frame["origin_md5"] != "") & (frame["mirror_md5"] == "")).sum()),
+        int(((frame["origin_md5"] == "") & (frame["mirror_md5"] != "")).sum()),
+    )
+    return path

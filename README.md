@@ -157,6 +157,42 @@ uv run python -m src.oibc.pipeline ecmwf-correct --base-sub <제출> --sub-id <�
 uv run python -m src.oibc.pipeline validate-submission --composition <composition.csv> --forecast <forecast.csv>
 ```
 
+### 최종 제출 재현 절차
+
+최고점 제출(`sub13-ec-v1b`)은 아래 순서로 처음부터 다시 만들 수 있습니다. 단계마다 `artifacts/submissions/<제출 이름>/manifest.json`에 `forecast_sha256`과 `composition_sha256`이 남으므로, 제출본의 manifest 값과 비교하면 바이트 단위로 같은지 확인할 수 있습니다.
+
+```bash
+# 1. 대회 자료 정제와 외부 예보 수집 (외부 예보는 고정 광역 상자 요약만 쓰고, 모든 발전소에 같은 값을 붙입니다)
+uv sync --group external
+uv run python -m src.oibc.pipeline ingest
+uv run python -m src.oibc.pipeline derive
+uv run python -m src.oibc.pipeline gfs-fetch
+uv run python -m src.oibc.pipeline gfs-audit       # 실행별 공개 시각(NOAA 원본 LastModified). 마감 이후 실행은 쓰지 않음
+uv run python -m src.oibc.pipeline gfs-hourly
+uv run python -m src.oibc.pipeline ecmwf-fetch     # 공식 미러(GCS) 우선, 없으면 원본(S3)
+uv run python -m src.oibc.pipeline ecmwf-audit     # 실행별 공개 시각(원본 S3 LastModified)
+uv run python -m src.oibc.pipeline ecmwf-equiv     # 원본·미러 파일 MD5·크기·시각 대조 근거
+uv run python -m src.oibc.pipeline features
+
+# 2. VPP 배정과 학습 (폴드 OOF는 ECMWF 보정 계수 적합에 씀)
+uv run python -m src.oibc.pipeline compose --comp-id geo64-s0
+uv run python -m src.oibc.pipeline validate-run --run-id prod-gfs-r1 --composition geo64-s0 \
+  --hypothesis "GFS 00z 광역 특성 추가, 기압 제외" --drop-var wa_ground_press --mlp-clip 0.001 0.999 \
+  --regional-weight 0.6 --cat-weight 0.2 --mlp-weight 0.2 --save-oof
+
+# 3. 평가 기간 예측과 후처리
+uv run python -m src.oibc.pipeline submit --run-id prod-gfs-r1 --sub-id sub08-gfs
+uv run python -m src.oibc.pipeline scale-submission --base-sub sub08-gfs --scale 0.97 --months 11 12 1 2 --sub-id sub10-gfs-winter097
+uv run python -m src.oibc.pipeline ecmwf-correct --base-sub sub10-gfs-winter097 --sub-id sub13-ec-v1b
+uv run python -m src.oibc.pipeline validate-submission \
+  --composition artifacts/submissions/sub13-ec-v1b/composition.csv --forecast artifacts/submissions/sub13-ec-v1b/forecast.csv
+```
+
+- **마감 준수:** 외부 예보는 대상일 전날 17:00 KST 이전에 공개된 실행만 씁니다. GFS는 D-1 00z를, ECMWF는 D-1 00z → D-2 18z → D-2 12z 순서로 씁니다. 공개 시각은 원본 버킷의 파일 시각이고, 마감 이후 공개된 실행은 그날 쓰지 않습니다.
+- **미러 동등성:** ECMWF 파일은 공식 미러(`storage.googleapis.com/ecmwf-open-data`)에서 받습니다. 공개 시각은 원본(`ecmwf-forecasts` S3)에서 읽습니다. `ecmwf-equiv`가 사용 파일마다 두 곳의 MD5·크기·LastModified를 `data/external/ecmwf/mirror_equiv.csv`에 남깁니다. 미러 사본의 시각은 공개 시각으로 쓰지 않습니다.
+- **겨울 배율 0.97:** 리더보드 결과를 보고 정한 값입니다. 학습 기간 OOF의 겨울 과대 수준(이전 겨울 실적/예측 비)으로 계산한 값 0.966~0.974와 같은 범위입니다.
+- **ECMWF 보정 계수:** 학습 기간 폴드 OOF로만 맞춥니다. 학습 종료 이후 OOF가 섞이면 중단합니다.
+
 dynamical.org 저장소를 쓸 수 없으면 `gfs-fetch --source noaa`로 NOAA 원본 GRIB(`noaa-gfs-bdp-pds`)에서 같은 형식의 파일을 만듭니다. 이미 있는 파일은 건드리지 않습니다. 대역폭은 init당 약 150MB이고, 전체 기간은 약 270GB입니다. 두 경로가 같은 특성을 만드는지는 `gfs-compare`(기본 표본 24개 init)로 확인합니다.
 
 ## 🤖 개발 과정에서의 AI 활용

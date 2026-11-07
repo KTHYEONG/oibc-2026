@@ -108,6 +108,52 @@ def test_submit_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
     assert calls[0][1]["local_metrics"] == {"W_all": 5.0, "W_warm": 2.0}
 
 
+def test_submit_ecmwf_substitute_predicts_on_substituted_panel(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import hashlib
+    from datetime import UTC, datetime
+
+    import pandas as pd
+
+    import src.oibc.data.ecmwf_substitute as sub_mod
+    from src.oibc.config import FeatureConfig, ModelConfig, RunConfig
+    from src.oibc.evaluate import registry as registry_mod
+    from src.oibc.evaluate.registry import ExperimentRecord
+    from src.oibc.submit import build as build_mod
+
+    panel_path = tmp_path / "panel.parquet"
+    panel_path.write_bytes(b"validated panel")
+    cfg = RunConfig(run_id="r1", hypothesis="h", features=FeatureConfig(groups=frozenset()), model=ModelConfig(seeds=(0,), weight="none"))
+    config = cfg.model_dump(mode="json") | {
+        "panel_path": str(panel_path), "panel_sha256": hashlib.sha256(panel_path.read_bytes()).hexdigest(),
+        "composition_sha256": "abc", "competition": CompetitionSpec().model_dump(mode="json"),
+    }
+    rec = ExperimentRecord(run_id="r1", created_at=datetime(2026, 1, 1, tzinfo=UTC), hypothesis="h", config=config, git_commit=None,
+                           seeds=(0,), folds=("A",), metrics={"A/0": {"W": 1.0}}, comparison={"bag": {"A": {"W_all": 5.0, "W_warm": 2.0}}})
+    monkeypatch.setattr(registry_mod, "read_records", lambda *a, **k: [rec])
+    monkeypatch.setattr(pd, "read_parquet", lambda *a, **k: pd.DataFrame({"site_id": ["s"], "current_group": ["A"]}))
+    monkeypatch.setattr(runner_mod, "resolve_composition", lambda *a, **k: (pd.DataFrame({"site_id": ["s"], "group": ["G1"]}), "abc"))
+    monkeypatch.setattr("src.oibc.pipeline._check_input_breaks", lambda *a, **k: [])
+    sub_panel = tmp_path / "sub.parquet"
+    seen: dict[str, object] = {}
+
+    def build(src, out, paths, ec_cfg, features, spec):
+        seen.update(src=src, out=out, features=features)
+        return sub_panel
+
+    def predict(actual_cfg, **kwargs):
+        seen["predict_panel"] = kwargs["panel_path"]
+        return pd.DataFrame({"group": ["G1"], "ts": [pd.Timestamp("2025-06-01 01:00", tz="Asia/Seoul")], "forecast_kwh": [1.0]})
+
+    monkeypatch.setattr(sub_mod, "build_substituted_panel", build)
+    monkeypatch.setattr(runner_mod, "forecast_eval", predict)
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: calls.append((a, k)))
+    assert main(["submit", "--run-id", "r1", "--sub-id", "s1", "--ecmwf-substitute"]) == 0
+    assert seen["src"] == panel_path and seen["predict_panel"] == sub_panel and seen["features"] == cfg.features
+    assert str(seen["out"]).endswith("panel_s1_ecsub.parquet")
+    assert "ecmwf-substitute lambda=0.5" in calls[0][1]["note"]
+
+
 @pytest.mark.parametrize("defect", ["config", "hash", "seeds", "bag_folds", "metrics", "negative"])
 def test_submit_rejects_changed_or_incomplete_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str) -> None:
     import hashlib
@@ -1189,6 +1235,8 @@ def _ecmwf_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sites: tuple[str
     # x = (140 - 100) / (100 + 100) = 0.2 → 학습 F=5, A=5.5에서 β=0.5
     monkeypatch.setattr(ec_mod, "ec_blocks", lambda *a, **k: pd.DataFrame({"op": ops, "blk": [1, 1], "ec_in": [140.0, 140.0], "src": ["00z", "18z"]}))
     monkeypatch.setattr(ec_mod, "gfs_blocks", lambda *a, **k: pd.DataFrame({"op": ops, "blk": [1, 1], "g_in": [100.0, 100.0]}))
+    monkeypatch.setattr(ec_mod, "aifs_blocks", lambda *a, **k: pd.DataFrame({"op": pd.to_datetime([]), "blk": pd.Series([], dtype="int64"), "a_in": pd.Series([], dtype="float64")}))
+    monkeypatch.setattr(ec_mod, "gfs_aifs_blocks", lambda *a, **k: pd.DataFrame({"op": pd.to_datetime([]), "blk": pd.Series([], dtype="int64"), "g_a": pd.Series([], dtype="float64")}))
     calls: list[tuple[tuple, dict]] = []
     monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: calls.append((a, k)))
     return paths, calls
@@ -1209,6 +1257,30 @@ def test_ecmwf_correct_submission_fits_beta_on_oof_and_scales_block_hours(tmp_pa
     assert kwargs["run_id"] == "base-run"
 
 
+def test_ecmwf_correct_submission_fits_beta_on_hres_only_then_applies_aifs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.oibc.data.external_ecmwf as ec_mod
+    from src.oibc.pipeline import ecmwf_correct_submission
+
+    paths, calls = _ecmwf_env(tmp_path, monkeypatch)
+    ops = [pd.Timestamp("2025-03-02"), pd.Timestamp("2026-01-22")]
+    # 학습일(03-02)에도 AIFS x가 있지만 β 적합에는 쓰지 않는다. 01-22는 18z라 x_a=(160-100)/200=0.3으로 바뀐다
+    monkeypatch.setattr(ec_mod, "aifs_blocks", lambda *a, **k: pd.DataFrame({"op": ops, "blk": [1, 1], "a_in": [100.0, 160.0]}))
+    monkeypatch.setattr(ec_mod, "gfs_aifs_blocks", lambda *a, **k: pd.DataFrame({"op": ops, "blk": [1, 1], "g_a": [100.0, 100.0]}))
+    ecmwf_correct_submission("base", "corr", paths=paths)
+    (_, forecast, _), kwargs = calls[0]
+    by_ts = forecast.set_index(forecast["ts"].dt.strftime("%m-%d %H"))["forecast_kwh"]
+    np.testing.assert_allclose(by_ts.loc["01-22 12"].to_numpy(), 115.0, rtol=0, atol=1e-9)
+    assert kwargs["note"].startswith("ecmwf-correct base=base beta=0.5 fit_rows=4")
+    assert "aifs_weight_00z=0.5" in kwargs["note"]
+    calls.clear()
+    from src.oibc.config import EcmwfConfig
+
+    ecmwf_correct_submission("base", "corr", paths=paths, cfg=EcmwfConfig(aifs_split_by_hres=True))
+    assert "aifs_split=True" in calls[0][1]["note"]
+
+
 def test_ecmwf_correct_submission_rejects_oof_site_outside_composition(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.oibc.pipeline import ecmwf_correct_submission
     from src.oibc.train.runner import RunnerError
@@ -1221,10 +1293,21 @@ def test_ecmwf_correct_submission_rejects_oof_site_outside_composition(tmp_path:
 def test_ecmwf_correct_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     import src.oibc.pipeline as pipeline_mod
 
-    seen: list[tuple[str, str]] = []
-    monkeypatch.setattr(pipeline_mod, "ecmwf_correct_submission", lambda b, s: seen.append((b, s)))
+    seen: list[tuple[str, str, bool, float]] = []
+    monkeypatch.setattr(
+        pipeline_mod,
+        "ecmwf_correct_submission",
+        lambda b, s, **k: seen.append((b, s, k["cfg"].use_aifs, k["cfg"].aifs_weight_00z)),
+    )
     assert pipeline_mod.main(["ecmwf-correct", "--base-sub", "b", "--sub-id", "s"]) == 0
-    assert seen == [("b", "s")]
+    assert pipeline_mod.main(["ecmwf-correct", "--base-sub", "b", "--sub-id", "s", "--no-aifs"]) == 0
+    assert pipeline_mod.main(["ecmwf-correct", "--base-sub", "b", "--sub-id", "s", "--aifs-weight-00z", "1"]) == 0
+    assert seen == [("b", "s", True, 0.5), ("b", "s", False, 0.5), ("b", "s", True, 1.0)]
+    split: list[bool] = []
+    monkeypatch.setattr(pipeline_mod, "ecmwf_correct_submission", lambda b, s, **k: split.append(k["cfg"].aifs_split_by_hres))
+    assert pipeline_mod.main(["ecmwf-correct", "--base-sub", "b", "--sub-id", "s", "--aifs-split"]) == 0
+    assert pipeline_mod.main(["ecmwf-correct", "--base-sub", "b", "--sub-id", "s", "--aifs-split", "--aifs-weight-00z", "1"]) == 0
+    assert split == [True, True]
 
 
 def test_ecmwf_correct_submission_contract_errors_and_base_note(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

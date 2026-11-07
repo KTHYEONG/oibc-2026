@@ -64,6 +64,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     ec_corr = sub.add_parser("ecmwf-correct")
     ec_corr.add_argument("--base-sub", required=True)
     ec_corr.add_argument("--sub-id", required=True)
+    ec_corr.add_argument("--no-aifs", action="store_true")
+    ec_corr.add_argument("--aifs-weight-00z", type=float, default=None)
+    ec_corr.add_argument("--aifs-split", action="store_true")
     validate_cmd = sub.add_parser("validate-submission")
     validate_cmd.add_argument("--composition", type=Path, required=True)
     validate_cmd.add_argument("--forecast", type=Path, required=True)
@@ -94,6 +97,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub_cmd.add_argument("--sub-id", required=True)
     sub_cmd.add_argument("--calibration", action="store_true")
     sub_cmd.add_argument("--allow-break", action="append", choices=raw_vars, default=[])
+    sub_cmd.add_argument("--ecmwf-substitute", action="store_true")
     splice = sub.add_parser("splice-submission")
     splice.add_argument("--base-sub", required=True)
     splice.add_argument("--fallback-sub", required=True)
@@ -146,7 +150,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         audit_mirror(DataPaths(), EcmwfConfig(), workers=args.workers)
     elif args.command == "ecmwf-correct":
-        ecmwf_correct_submission(args.base_sub, args.sub_id)
+        ec_cfg = EcmwfConfig(use_aifs=not args.no_aifs, aifs_split_by_hres=args.aifs_split)
+        if args.aifs_weight_00z is not None:
+            ec_cfg = EcmwfConfig(
+                use_aifs=not args.no_aifs, aifs_split_by_hres=args.aifs_split, aifs_weight_00z=args.aifs_weight_00z
+            )
+        ecmwf_correct_submission(args.base_sub, args.sub_id, cfg=ec_cfg)
     elif args.command == "validate-submission":
         report = validate_submission(args.composition, args.forecast)
         for warn in report.warnings:
@@ -292,6 +301,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         breaks = _check_input_breaks(cfg, spec, set(args.allow_break))
         if breaks:
             note = "; ".join(part for part in (note, *breaks) if part)
+        if args.ecmwf_substitute:
+            from src.oibc.data.ecmwf_substitute import build_substituted_panel
+
+            ec_cfg = EcmwfConfig()
+            panel_path = build_substituted_panel(
+                panel_path,
+                DataPaths().features_dir / f"panel_{args.sub_id}_ecsub.parquet",
+                DataPaths(),
+                ec_cfg,
+                cfg.features,
+                spec,
+            )
+            sub_note = f"ecmwf-substitute lambda={ec_cfg.substitute_lambda!r} (평가 기간 GFS sw 입력, 학습 행 불변)"
+            note = "; ".join(part for part in (note, sub_note) if part)
         forecast = forecast_eval(cfg, panel_path=panel_path, spec=spec, calibration=cal, calibration_cfg=cal_cfg)
         _, final_sha = resolve_composition(
             cfg.composition_id, pd.read_parquet(DataPaths().canonical_dir / "sites.parquet"), spec=spec,
@@ -541,11 +564,16 @@ def ecmwf_correct_submission(
     import pandas as pd
 
     from src.oibc.data.external_ecmwf import (
+        aifs_blocks,
+        aifs_x,
+        combine_aifs,
         correction_multiplier,
         ec_blocks,
         fit_beta,
         fit_frame,
+        gfs_aifs_blocks,
         gfs_blocks,
+        split_aifs_x,
         x_table,
     )
     from src.oibc.data.external_gfs import ExternalError, hourly_path
@@ -572,15 +600,19 @@ def ecmwf_correct_submission(
     smp = pd.read_parquet(data_paths.canonical_dir / "smp.parquet", columns=["ts", "smp", "k"])
     weights = pd.Series((smp["smp"].astype("float64") * smp["k"].astype("float64")).to_numpy(), index=smp["ts"])
     try:
-        xt = x_table(
-            ec_blocks(data_paths, ec_cfg, comp_spec),
-            gfs_blocks(pd.read_parquet(hourly_path(data_paths)), ec_cfg),
-            ec_cfg,
-        )
+        gfs_hourly = pd.read_parquet(hourly_path(data_paths))
+        ec = ec_blocks(data_paths, ec_cfg, comp_spec)
+        gb = gfs_blocks(gfs_hourly, ec_cfg)
+        xt = x_table(ec, gb, ec_cfg)
+        # β는 이력이 긴 HRES x로만 맞추고, AIFS는 적용 단계에서만 결합한다(AIFS 학습 겹침은 3개월뿐)
         h = fit_frame(group_oof, weights, xt, ec_cfg)
         beta = fit_beta(
             h["pred_bag"].to_numpy(), h["actual_kwh"].to_numpy(), h["w"].to_numpy(), h["x"].to_numpy(), ec_cfg
         )
+        if ec_cfg.use_aifs:
+            ab, ga = aifs_blocks(data_paths, ec_cfg, comp_spec), gfs_aifs_blocks(gfs_hourly, ec_cfg)
+            xa = split_aifs_x(ab, ec, ga, gb, ec_cfg) if ec_cfg.aifs_split_by_hres else aifs_x(ab, ga, ec_cfg)
+            xt = combine_aifs(xt, xa, ec_cfg)
         mult = correction_multiplier(base_fc["ts"], xt, beta, ec_cfg)
     except ExternalError as exc:
         raise RunnerError(f"ecmwf: {exc}") from exc
@@ -588,6 +620,8 @@ def ecmwf_correct_submission(
     out["forecast_kwh"] = base_fc["forecast_kwh"].to_numpy(dtype="float64") * mult
     src_counts = xt["src"].value_counts().to_dict()
     note = f"ecmwf-correct base={base_sub} beta={beta!r} fit_rows={len(h)} x_src={src_counts}"
+    if ec_cfg.use_aifs:
+        note = f"{note} aifs_weight_00z={ec_cfg.aifs_weight_00z!r} aifs_split={ec_cfg.aifs_split_by_hres}"
     if base_m.note:
         note = f"{note}; base_note={base_m.note}"
     logger.info(

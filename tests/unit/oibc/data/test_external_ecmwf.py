@@ -6,6 +6,15 @@ import pytest
 
 from src.oibc.config import CompetitionSpec, DataPaths, EcmwfConfig
 from src.oibc.data.external_ecmwf import (
+    aifs_block_means,
+    aifs_blocks,
+    aifs_window_ts_hours,
+    aifs_windows,
+    aifs_x,
+    all_runs,
+    combine_aifs,
+    gfs_aifs_blocks,
+    target_dates,
     audit_path,
     block_index,
     block_leads,
@@ -25,6 +34,7 @@ from src.oibc.data.external_ecmwf import (
     run_dir,
     run_init,
     run_prefix,
+    split_aifs_x,
     x_table,
 )
 from src.oibc.data.external_gfs import ExternalError
@@ -278,3 +288,98 @@ def test_compare_mirror_matches_only_identical_files_present_in_both(tmp_path: P
     assert rows["k1"]["run"] == "18z" and rows["k1"]["target_date"] == "2024-09-19"
     assert rows["k1"]["origin_lastmod"] == "t0" and rows["k1"]["mirror_lastmod"] == "t1"
     assert mirror_equiv_path(DataPaths(external_dir=tmp_path)) == tmp_path / "ecmwf" / "mirror_equiv.csv"
+
+
+def test_aifs_windows_map_to_target_day_hours_and_prefix() -> None:
+    assert aifs_windows(CFG) == [(18, 24), (24, 30), (30, 36)]
+    # D-1 00z 리드 L은 대상일 KST L-15시 → (18,24]는 ts 4~9시
+    assert [list(r) for r in aifs_window_ts_hours(CFG)] == [list(range(4, 10)), list(range(10, 16)), list(range(16, 22))]
+    assert needed_leads(CFG.aifs, CFG) == [18, 24, 30, 36]
+    assert run_prefix(CFG.aifs, pd.Timestamp("2025-07-02"), CFG) == "20250701/00z/aifs-single/0p25/oper/20250701000000-"
+    assert target_dates(CFG, CFG.aifs)[0] == pd.Timestamp(CFG.aifs_target_start)
+    assert all_runs(CFG)[-1] == CFG.aifs and all_runs(CFG.model_copy(update={"use_aifs": False})) == CFG.runs
+
+
+def test_aifs_config_rejects_bad_window_map() -> None:
+    with pytest.raises(ValueError, match="aifs_block_window"):
+        EcmwfConfig(aifs_block_window=(0, 1, 2))
+    with pytest.raises(ValueError, match="out of range"):
+        EcmwfConfig(aifs_block_window=(0, 1, 1, 3))
+
+
+def _aifs_acc(rate: float) -> dict[str, np.ndarray]:
+    return {f"ssrd_{h}": np.full((3, 3), rate * h * 3600.0) for h in (18, 24, 30, 36)}
+
+
+def test_aifs_block_means_uses_window_per_block_and_requires_all_leads() -> None:
+    arr = _aifs_acc(200.0)
+    arr["ssrd_30"] = arr["ssrd_30"] + 6 * 3600.0 * 100.0  # (24,30] 창만 +100 W/m², (30,36] 창은 -100
+    out = aifs_block_means(arr, LAT, LON, CFG)
+    np.testing.assert_allclose(out, [200.0, 300.0, 300.0, 100.0], rtol=0, atol=1e-9)
+    assert aifs_block_means({k: v for k, v in arr.items() if k != "ssrd_36"}, LAT, LON, CFG) is None
+    with pytest.raises(ExternalError, match="shape"):
+        aifs_block_means({k: v[:2] for k, v in arr.items()}, LAT, LON, CFG)
+
+
+def test_aifs_blocks_skip_late_or_unlisted_runs(tmp_path: Path) -> None:
+    paths = DataPaths(external_dir=tmp_path)
+    cfg = CFG.model_copy(update={"aifs_target_start": "2025-07-01", "target_end": "2025-07-03"})
+    folder = run_dir(paths, cfg.aifs)
+    folder.mkdir(parents=True)
+    for d in ("20250701", "20250702", "20250703"):
+        np.savez(folder / f"{d}.npz", lat=LAT, lon=LON, **_aifs_acc(150.0))
+    audit = pd.DataFrame({"target_date": ["2025-07-01", "2025-07-02", "2025-07-03"], "init": ["", "", ""],
+                          "published_utc": ["2025-06-30T05:15:00+00:00", "2025-07-01T08:00:01+00:00", ""]})
+    audit_path(paths, cfg.aifs).parent.mkdir(parents=True, exist_ok=True)
+    audit.to_csv(audit_path(paths, cfg.aifs), index=False)
+    out = aifs_blocks(paths, cfg, CompetitionSpec())
+    assert set(out["op"]) == {pd.Timestamp("2025-07-01")} and len(out) == 4
+    np.testing.assert_allclose(out["a_in"], 150.0)
+
+
+def test_gfs_aifs_blocks_average_window_hours() -> None:
+    ts = pd.Series(pd.date_range("2025-07-01 01:00", periods=24, freq="h", tz=_KST))
+    g = pd.DataFrame({"ts": ts, "gfs00_sw_in": ts.dt.hour.astype(float)})
+    out = gfs_aifs_blocks(g, CFG).set_index("blk")["g_a"]
+    np.testing.assert_allclose(out.to_numpy(), [6.5, 12.5, 12.5, 18.5])
+    with pytest.raises(ExternalError, match="missing"):
+        gfs_aifs_blocks(g.drop(columns="gfs00_sw_in"), CFG)
+
+
+def test_combine_aifs_blends_00z_swaps_fallback_and_adds_aifs_only() -> None:
+    d = [pd.Timestamp("2025-07-01")] * 4
+    xt = pd.DataFrame({"op": d[:3], "blk": [0, 1, 2], "x": [0.2, 0.2, 0.2], "src": ["00z", "18z", "12z"]})
+    xa = aifs_x(pd.DataFrame({"op": d, "blk": [0, 1, 2, 3], "a_in": [140.0, 160.0, 100.0, 120.0]}),
+                pd.DataFrame({"op": d, "blk": [0, 1, 2, 3], "g_a": [100.0] * 4}), CFG)
+    out = combine_aifs(xt, xa, CFG).set_index("blk")
+    np.testing.assert_allclose(out["x"].to_numpy(), [0.2, 0.3, 0.0, 0.1], rtol=0, atol=1e-12)
+    assert out["src"].tolist() == ["00z+aifs", "aifs00", "aifs00", "aifs00"]
+    full = combine_aifs(xt, xa, CFG.model_copy(update={"aifs_weight_00z": 1.0})).set_index("blk")
+    assert full.loc[0, "x"] == xa.set_index("blk").loc[0, "x_a"]
+    none = combine_aifs(xt, xa.iloc[0:0], CFG).set_index("blk")
+    assert none["x"].tolist() == [0.2, 0.2, 0.2] and none["src"].tolist() == ["00z", "18z", "12z"]
+
+
+def test_aifs_fail_closed_on_bad_leads_window_and_empty_box() -> None:
+    bad = CFG.aifs.model_copy(update={"leads": (18,)})
+    with pytest.raises(ValueError, match=r"aifs\.leads"):
+        EcmwfConfig(aifs=bad)
+    early = CFG.model_copy(update={"aifs": CFG.aifs.model_copy(update={"leads": (12, 18, 24, 30)})})
+    with pytest.raises(ExternalError, match="outside the target day"):
+        aifs_window_ts_hours(early)
+    with pytest.raises(ExternalError, match="empty inner box"):
+        aifs_block_means(_aifs_acc(100.0), LAT + 20.0, LON, CFG)
+
+
+def test_split_aifs_x_uses_hres_shape_for_shared_window_only() -> None:
+    d = pd.Timestamp("2025-07-01")
+    ops = [d] * 4
+    aifs = pd.DataFrame({"op": ops, "blk": [0, 1, 2, 3], "a_in": [100.0, 300.0, 300.0, 100.0]})
+    gwin = pd.DataFrame({"op": ops, "blk": [0, 1, 2, 3], "g_a": [100.0, 200.0, 200.0, 100.0]})
+    gblk = pd.DataFrame({"op": ops, "blk": [0, 1, 2, 3], "g_in": [50.0, 150.0, 250.0, 50.0]})
+    ec = pd.DataFrame({"op": ops, "blk": [0, 1, 2, 3], "ec_in": [10.0, 200.0, 400.0, 10.0]})
+    out = split_aifs_x(aifs, ec, gwin, gblk, CFG).set_index("blk")["x_a"]
+    # 블록 1·2: a = 300·(200|400)/300 → 200, 400을 블록 GFS 150, 250과 비교. 블록 0·3은 창 값 그대로
+    np.testing.assert_allclose(out.to_numpy(), [0.0, 50 / 250, 150 / 350, 0.0], rtol=0, atol=1e-12)
+    partial = split_aifs_x(aifs, ec[ec["blk"] != 2], gwin, gblk, CFG).set_index("blk")["x_a"]
+    np.testing.assert_allclose(partial.loc[[1, 2]].to_numpy(), [100 / 300, 100 / 300], rtol=0, atol=1e-12)

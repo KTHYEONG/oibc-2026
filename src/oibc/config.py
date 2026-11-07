@@ -212,10 +212,12 @@ class EcmwfRunSpec(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    name: str = Field(pattern=r"^\d{2}z$")
+    name: str = Field(pattern=r"^(\d{2}z|aifs\d{2})$")
     days_back: int = Field(ge=1, le=3)
     init_hour_utc: int = Field(ge=0, le=23)
     stream: Literal["oper", "scda"]
+    product: Literal["ifs", "aifs-single"] = "ifs"
+    leads: tuple[int, ...] | None = None  # None이면 블록 정의에서 리드를 계산한다(IFS 3시간 간격)
 
 
 class EcmwfConfig(BaseModel):
@@ -245,6 +247,27 @@ class EcmwfConfig(BaseModel):
     x_offset_wm2: float = Field(default=100.0, gt=0)
     beta_grid: tuple[float, float, float] = (-0.2, 1.2, 0.05)  # 시작, 끝(포함), 간격
     fit_folds: tuple[str, ...] = ("A", "B")
+    # AIFS Single 00z: 6시간 누적 리드만 있고 마감 전에 공개된다(e58·e59·e64 판정, LB sub15)
+    use_aifs: bool = True
+    aifs: EcmwfRunSpec = EcmwfRunSpec(
+        name="aifs00", days_back=1, init_hour_utc=0, stream="oper", product="aifs-single", leads=(18, 24, 30, 36)
+    )
+    aifs_target_start: str = "2025-03-01"
+    aifs_block_window: tuple[int, ...] = (0, 1, 1, 2)  # 블록마다 쓰는 AIFS 창(연속 리드 쌍) 번호
+    aifs_weight_00z: float = Field(default=0.5, ge=0.0, le=1.0)  # HRES 00z가 있는 블록의 AIFS 비중
+    aifs_split_by_hres: bool = False  # 한 AIFS 창을 공유하는 블록을 HRES 블록 모양으로 나눈다(e85 A6)
+    substitute_lambda: float = Field(default=0.5, gt=0.0, le=1.0)  # 입력 대체 G → G + λ(E - G), 결과 전 고정(e87)
+
+    @model_validator(mode="after")
+    def _check_aifs(self) -> EcmwfConfig:
+        leads = self.aifs.leads
+        if leads is None or list(leads) != sorted(set(leads)) or len(leads) < 2:
+            raise ValueError("aifs.leads must be strictly increasing with at least two values")
+        if len(self.aifs_block_window) != len(self.block_end_hours):
+            raise ValueError("aifs_block_window must have one window per block")
+        if any(not 0 <= w < len(leads) - 1 for w in self.aifs_block_window):
+            raise ValueError("aifs_block_window index out of range")
+        return self
 
 
 class FeatureConfig(BaseModel):

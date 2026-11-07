@@ -835,20 +835,14 @@ def run_validation(
     return record
 
 
-def forecast_eval(
+def _eval_site_bag(
     cfg: RunConfig,
-    *,
-    panel_path: Path | None = None,
-    spec: CompetitionSpec | None = None,
-    paths: ArtifactPaths | None = None,
-    calibration: CloudCalibration | None = None,
-    calibration_cfg: CalibrationConfig | None = None,
-) -> pd.DataFrame:
-    """학습 기간 전체로 학습한 seed-bag 모델의 평가 기간 (group, ts, forecast_kwh) 예측을 반환한다."""
-    if (calibration is None) != (calibration_cfg is None):
-        raise RunnerError("forecast: calibration and calibration_cfg must be paired")
-    comp = spec if spec is not None else CompetitionSpec()
-    panel_file = panel_path if panel_path is not None else _default_panel_path()
+    panel_file: Path,
+    comp: CompetitionSpec,
+    paths: ArtifactPaths | None,
+    calibration: CloudCalibration | None,
+    calibration_cfg: CalibrationConfig | None,
+) -> tuple[pd.DataFrame, np.ndarray, pd.DataFrame, pd.DataFrame, pd.DatetimeIndex]:
     panel = _load_panel(panel_file, cfg, comp)
     families_active = cfg.model.families.cat_weight > 0 or cfg.model.families.mlp_weight > 0
     site_geo = _site_geo(panel) if cfg.model.regional.weight > 0 or families_active else None
@@ -933,7 +927,27 @@ def forecast_eval(
             raise RunnerError(f"forecast: {exc}") from exc
     del preds
     gc.collect()
-    day = eval_day[["site_id", "ts"]].assign(forecast_kwh=mean)
+    return eval_day[["site_id", "ts"]], mean, grid, assignment, eval_ts
+
+
+def forecast_eval(
+    cfg: RunConfig,
+    *,
+    panel_path: Path | None = None,
+    spec: CompetitionSpec | None = None,
+    paths: ArtifactPaths | None = None,
+    calibration: CloudCalibration | None = None,
+    calibration_cfg: CalibrationConfig | None = None,
+) -> pd.DataFrame:
+    """학습 기간 전체로 학습한 seed-bag 모델의 평가 기간 (group, ts, forecast_kwh) 예측을 반환한다."""
+    if (calibration is None) != (calibration_cfg is None):
+        raise RunnerError("forecast: calibration and calibration_cfg must be paired")
+    comp = spec if spec is not None else CompetitionSpec()
+    panel_file = panel_path if panel_path is not None else _default_panel_path()
+    eval_keys, mean, grid, assignment, eval_ts = _eval_site_bag(
+        cfg, panel_file, comp, paths, calibration, calibration_cfg
+    )
+    day = eval_keys.assign(forecast_kwh=mean)
     full = grid[["site_id", "ts"]].merge(day, on=["site_id", "ts"], how="left", validate="one_to_one")
     full["forecast_kwh"] = full["forecast_kwh"].fillna(0.0)
     full = full.merge(assignment, on="site_id", how="left", validate="many_to_one")
@@ -957,6 +971,53 @@ def forecast_eval(
     group_total = float(out["forecast_kwh"].sum())
     _require(bool(np.isfinite([group_total, site_total]).all()), "forecast: total overflow")
     _require(bool(np.isclose(group_total, site_total, rtol=1e-9, atol=1e-6)), "forecast: group total mismatch")
+    return out
+
+
+def edge_fill_forecast(
+    base: pd.DataFrame,
+    edge_cfg: RunConfig,
+    *,
+    base_min_elev_deg: float,
+    panel_path: Path,
+    spec: CompetitionSpec | None = None,
+    paths: ArtifactPaths | None = None,
+) -> pd.DataFrame:
+    """기준 예측이 야간 0으로 둔 (edge 하한, base 하한] 고도 행에 edge 모델 예측의 그룹 합을 더해 반환한다. 위반 시 RunnerError."""
+    edge_min = edge_cfg.features.day_min_elev_deg
+    if not edge_min < base_min_elev_deg:
+        raise RunnerError("edge: edge day_min_elev_deg must be below base")
+    if list(base.columns) != ["group", "ts", "forecast_kwh"]:
+        raise RunnerError("edge: base columns must be group,ts,forecast_kwh")
+    comp = spec if spec is not None else CompetitionSpec()
+    eval_keys, mean, _, assignment, _ = _eval_site_bag(edge_cfg, panel_path, comp, paths, None, None)
+    solar = _read(DataPaths().derived_dir / "solar.parquet", ["site_id", "ts", "elev"])
+    _check_keys(solar)
+    site = eval_keys.assign(pred=mean).merge(solar, on=["site_id", "ts"], how="left", validate="one_to_one")
+    elev = site["elev"].to_numpy(dtype="float64")
+    if not np.isfinite(elev).all() or not (elev > edge_min).all():
+        raise RunnerError("edge: missing or out-of-range solar elevation")
+    edge = site.loc[elev <= base_min_elev_deg, ["site_id", "ts", "pred"]]
+    edge = edge.merge(assignment, on="site_id", how="left", validate="many_to_one")
+    if edge["group"].isna().any():
+        raise RunnerError("edge: unassigned site")
+    edge["group"] = edge["group"].astype(str)
+    esum = edge.groupby(["group", "ts"])["pred"].sum().rename("edge_kwh").reset_index()
+    out = base.assign(group=base["group"].astype(str)).merge(esum, on=["group", "ts"], how="left", validate="one_to_one")
+    if len(out) != len(base) or int(out["edge_kwh"].notna().sum()) != len(esum):
+        raise RunnerError("edge: edge keys outside base forecast")
+    out["forecast_kwh"] = out["forecast_kwh"].to_numpy(dtype="float64") + out["edge_kwh"].fillna(0.0).to_numpy(dtype="float64")
+    out["group"] = out["group"].astype("string")
+    out = out[["group", "ts", "forecast_kwh"]]
+    added = float(esum["edge_kwh"].sum())
+    _require(
+        bool(np.isclose(out["forecast_kwh"].sum(), base["forecast_kwh"].sum() + added, rtol=1e-9, atol=1e-6)),
+        "edge: total mismatch",
+    )
+    logger.info(
+        "[FCST] edge-fill run=%s rows=%d edge_kwh=%.3f elev=(%g,%g]",
+        edge_cfg.run_id, len(edge), added, edge_min, base_min_elev_deg,
+    )
     return out
 
 

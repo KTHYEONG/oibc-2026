@@ -33,6 +33,7 @@ from src.oibc.submit.validate import validate_submission
 if TYPE_CHECKING:
     import pandas as pd
 
+    from src.oibc.evaluate.registry import ExperimentRecord
     from src.oibc.submit.build import SubmissionManifest
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub_cmd.add_argument("--calibration", action="store_true")
     sub_cmd.add_argument("--allow-break", action="append", choices=raw_vars, default=[])
     sub_cmd.add_argument("--ecmwf-substitute", action="store_true")
+    sub_cmd.add_argument("--edge-run-id", default=None)
     splice = sub.add_parser("splice-submission")
     splice.add_argument("--base-sub", required=True)
     splice.add_argument("--fallback-sub", required=True)
@@ -209,44 +211,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "submit":
         import pandas as pd
 
-        from src.oibc.evaluate.registry import read_records
         from src.oibc.submit.build import write_submission
         from src.oibc.train.runner import RunnerError, forecast_eval, resolve_composition
 
-        records = read_records()
-        match = next((r for r in records if r.run_id == args.run_id), None)
-        if match is None:
-            raise RunnerError(f"submit: unknown run_id {args.run_id!r}")
-        comparison = match.comparison or {}
-        bag_map = comparison.get("bag", {})
-        if not isinstance(bag_map, dict) or not bag_map:
-            raise RunnerError("submit: missing bag metrics")
-        if set(bag_map) != set(match.folds):
-            raise RunnerError("submit: incomplete bag folds")
-        try:
-            local_metrics = {
-                name: sum(float(bag_map[fold][name]) for fold in match.folds)
-                for name in ("W_all", "W_warm")
-            }
-            config = match.config
-            if not {"features", "model", "panel_path", "panel_sha256", "competition"} <= set(config):
-                raise ValueError("missing reproducibility config")
-            cfg = RunConfig.model_validate(config)
-            spec_data = dict(config["competition"])
-            for key in ("train_end", "eval_start", "eval_end"):
-                spec_data[key] = pd.Timestamp(spec_data[key]).tz_convert("Asia/Seoul")
-            spec = CompetitionSpec.model_validate(spec_data)
-            panel_path = Path(config["panel_path"])
-            with panel_path.open("rb") as fh:
-                panel_hash = hashlib.file_digest(fh, "sha256").hexdigest()
-        except (KeyError, TypeError, ValueError, OSError) as exc:
-            raise RunnerError(f"submit: invalid recorded config or metrics ({exc})") from exc
-        if (
-            cfg.run_id != match.run_id or cfg.model.seeds != match.seeds
-            or panel_hash != config["panel_sha256"]
-            or not all(math.isfinite(v) and v >= 0 for v in local_metrics.values())
-        ):
-            raise RunnerError("submit: changed panel, seeds or invalid metrics")
+        if args.edge_run_id is not None and args.calibration:
+            raise RunnerError("submit: edge fill with calibration is not validated")
+        match, cfg, spec, panel_path, panel_hash, local_metrics = _submit_record(args.run_id)
+        config = match.config
         sites = pd.read_parquet(DataPaths().canonical_dir / "sites.parquet")
         assignment, comp_sha = resolve_composition(cfg.composition_id, sites, spec=spec)
         if "composition_sha256" in config:
@@ -316,6 +287,37 @@ def main(argv: Sequence[str] | None = None) -> int:
             sub_note = f"ecmwf-substitute lambda={ec_cfg.substitute_lambda!r} (평가 기간 GFS sw 입력, 학습 행 불변)"
             note = "; ".join(part for part in (note, sub_note) if part)
         forecast = forecast_eval(cfg, panel_path=panel_path, spec=spec, calibration=cal, calibration_cfg=cal_cfg)
+        if args.edge_run_id is not None:
+            from src.oibc.train.runner import edge_fill_forecast
+
+            edge_match, edge_cfg, edge_spec, edge_panel, _, _ = _submit_record(args.edge_run_id)
+            if (
+                edge_cfg.composition_id != cfg.composition_id
+                or edge_match.config.get("composition_sha256") != comp_sha
+                or edge_spec != spec
+            ):
+                raise RunnerError("submit: edge run composition or competition mismatch")
+            if edge_cfg.model != cfg.model:
+                raise RunnerError("submit: edge run model config differs from base")
+            if args.ecmwf_substitute:
+                from src.oibc.data.ecmwf_substitute import build_substituted_panel
+
+                edge_panel = build_substituted_panel(
+                    edge_panel,
+                    DataPaths().features_dir / f"panel_{args.sub_id}_edge_ecsub.parquet",
+                    DataPaths(),
+                    EcmwfConfig(),
+                    edge_cfg.features,
+                    spec,
+                )
+            forecast = edge_fill_forecast(
+                forecast, edge_cfg, base_min_elev_deg=cfg.features.day_min_elev_deg, panel_path=edge_panel, spec=spec,
+            )
+            edge_note = (
+                f"edge-fill run={args.edge_run_id} elev=({edge_cfg.features.day_min_elev_deg:g},"
+                f"{cfg.features.day_min_elev_deg:g}]"
+            )
+            note = "; ".join(part for part in (note, edge_note) if part)
         _, final_sha = resolve_composition(
             cfg.composition_id, pd.read_parquet(DataPaths().canonical_dir / "sites.parquet"), spec=spec,
         )
@@ -380,6 +382,49 @@ def main(argv: Sequence[str] | None = None) -> int:
     elapsed = time.perf_counter() - start
     logger.info("[SYS] pipeline %s done in %.1fs", args.command, elapsed)
     return exit_code
+
+
+def _submit_record(run_id: str) -> tuple[ExperimentRecord, RunConfig, CompetitionSpec, Path, str, dict[str, float]]:
+    """제출용 등록 run을 읽어 설정·대회 명세·패널 경로·해시·로컬 지표를 검증해 반환한다. 위반 시 RunnerError."""
+    import pandas as pd
+
+    from src.oibc.evaluate.registry import read_records
+    from src.oibc.train.runner import RunnerError
+
+    match = next((r for r in read_records() if r.run_id == run_id), None)
+    if match is None:
+        raise RunnerError(f"submit: unknown run_id {run_id!r}")
+    comparison = match.comparison or {}
+    bag_map = comparison.get("bag", {})
+    if not isinstance(bag_map, dict) or not bag_map:
+        raise RunnerError("submit: missing bag metrics")
+    if set(bag_map) != set(match.folds):
+        raise RunnerError("submit: incomplete bag folds")
+    try:
+        local_metrics = {
+            name: sum(float(bag_map[fold][name]) for fold in match.folds)
+            for name in ("W_all", "W_warm")
+        }
+        config = match.config
+        if not {"features", "model", "panel_path", "panel_sha256", "competition"} <= set(config):
+            raise ValueError("missing reproducibility config")
+        cfg = RunConfig.model_validate(config)
+        spec_data = dict(config["competition"])
+        for key in ("train_end", "eval_start", "eval_end"):
+            spec_data[key] = pd.Timestamp(spec_data[key]).tz_convert("Asia/Seoul")
+        spec = CompetitionSpec.model_validate(spec_data)
+        panel_path = Path(config["panel_path"])
+        with panel_path.open("rb") as fh:
+            panel_hash = hashlib.file_digest(fh, "sha256").hexdigest()
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        raise RunnerError(f"submit: invalid recorded config or metrics ({exc})") from exc
+    if (
+        cfg.run_id != match.run_id or cfg.model.seeds != match.seeds
+        or panel_hash != config["panel_sha256"]
+        or not all(math.isfinite(v) and v >= 0 for v in local_metrics.values())
+    ):
+        raise RunnerError("submit: changed panel, seeds or invalid metrics")
+    return match, cfg, spec, panel_path, panel_hash, local_metrics
 
 
 _PROVIDERS: tuple[Literal["wa", "wb"], ...] = ("wa", "wb")

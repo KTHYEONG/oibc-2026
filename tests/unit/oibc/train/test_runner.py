@@ -24,6 +24,7 @@ from src.oibc.timeaxis import op_date
 from src.oibc.train import runner as runner_mod
 from src.oibc.train.runner import (
     RunnerError,
+    edge_fill_forecast,
     forecast_eval,
     load_daily_runs,
     load_oof,
@@ -2827,3 +2828,57 @@ def test_forecast_eval_wraps_family_error(tmp_path: Path, monkeypatch: pytest.Mo
     monkeypatch.setattr(runner_mod, "fit_predict_catboost", _boom)
     with pytest.raises(RunnerError, match="boom-forecast-family"):
         forecast_eval(_family_cfg("famerrfc", 0.2, 0.0), panel_path=panel, spec=_spec())
+
+
+def test_edge_fill_adds_edge_group_sums_only(tmp_path: Path) -> None:
+    panel = _make_panel(tmp_path)
+    base = forecast_eval(_cfg("base"), panel_path=panel, spec=_spec())
+    edge_only = forecast_eval(_cfg("edge"), panel_path=panel, spec=_spec())
+    out = edge_fill_forecast(base, _cfg("edge"), base_min_elev_deg=40.0, panel_path=panel, spec=_spec())
+    assert list(out.columns) == ["group", "ts", "forecast_kwh"] and len(out) == len(base)
+    assert str(out["forecast_kwh"].dtype) == "float64" and str(out["ts"].dtype) == _DT
+    np.testing.assert_array_equal(
+        out["forecast_kwh"].to_numpy(), base["forecast_kwh"].to_numpy() + edge_only["forecast_kwh"].to_numpy()
+    )
+    night = out["ts"].dt.hour.isin([0, 1, 2, 3])
+    assert bool((out.loc[night, "forecast_kwh"] == 0.0).all())
+
+
+def test_edge_fill_outside_band_adds_nothing(tmp_path: Path) -> None:
+    panel = _make_panel(tmp_path)
+    base = forecast_eval(_cfg("base"), panel_path=panel, spec=_spec())
+    out = edge_fill_forecast(base, _cfg("edge"), base_min_elev_deg=10.0, panel_path=panel, spec=_spec())
+    np.testing.assert_array_equal(out["forecast_kwh"].to_numpy(), base["forecast_kwh"].to_numpy())
+
+
+def test_edge_fill_guards(tmp_path: Path) -> None:
+    panel = _make_panel(tmp_path)
+    base = forecast_eval(_cfg("base"), panel_path=panel, spec=_spec())
+    with pytest.raises(RunnerError, match="below base"):
+        edge_fill_forecast(base, _cfg("edge"), base_min_elev_deg=0.0, panel_path=panel, spec=_spec())
+    with pytest.raises(RunnerError, match="columns"):
+        edge_fill_forecast(base.rename(columns={"forecast_kwh": "f"}), _cfg("edge"), base_min_elev_deg=40.0,
+                           panel_path=panel, spec=_spec())
+    partial = base[base["ts"].dt.hour != 12].reset_index(drop=True)
+    with pytest.raises(RunnerError, match="outside base"):
+        edge_fill_forecast(partial, _cfg("edge"), base_min_elev_deg=40.0, panel_path=panel, spec=_spec())
+
+
+@pytest.mark.parametrize("defect", ["elevation", "unassigned"])
+def test_edge_fill_rejects_bad_edge_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str) -> None:
+    panel = _make_panel(tmp_path)
+    base = forecast_eval(_cfg("base"), panel_path=panel, spec=_spec())
+    real = runner_mod._eval_site_bag
+
+    def tampered(*args: object, **kwargs: object) -> tuple[object, ...]:
+        keys, mean, grid, assignment, eval_ts = real(*args, **kwargs)  # type: ignore[arg-type]
+        if defect == "elevation":
+            keys = keys.assign(ts=keys["ts"] - pd.Timedelta(hours=10))
+        else:
+            assignment = assignment.iloc[1:]
+        return keys, mean, grid, assignment, eval_ts
+
+    monkeypatch.setattr(runner_mod, "_eval_site_bag", tampered)
+    match = {"elevation": "solar elevation", "unassigned": "unassigned"}[defect]
+    with pytest.raises(RunnerError, match=match):
+        edge_fill_forecast(base, _cfg("edge"), base_min_elev_deg=40.0, panel_path=panel, spec=_spec())

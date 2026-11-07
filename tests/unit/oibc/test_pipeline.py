@@ -1341,3 +1341,79 @@ def test_ecmwf_correct_submission_contract_errors_and_base_note(tmp_path: Path, 
     manifest_path.write_text(_json.dumps(manifest), encoding="utf-8")
     with pytest.raises(RunnerError, match="no run_id"):
         ecmwf_correct_submission("base", "corr", paths=paths)
+
+
+def _edge_records(tmp_path: Path, *, edge_comp_sha: str = "abc", edge_model: object = None) -> list[object]:
+    import hashlib
+    from datetime import UTC, datetime
+
+    from src.oibc.config import FeatureConfig, ModelConfig, RunConfig
+    from src.oibc.evaluate.registry import ExperimentRecord
+
+    recs = []
+    for run_id, elev, sha, model in (
+        ("base", 0.0, "abc", ModelConfig(seeds=(0,), weight="none")),
+        ("edge", -5.0, edge_comp_sha, edge_model or ModelConfig(seeds=(0,), weight="none")),
+    ):
+        panel = tmp_path / f"{run_id}.parquet"
+        panel.write_bytes(run_id.encode())
+        cfg = RunConfig(run_id=run_id, hypothesis="h", features=FeatureConfig(groups=frozenset(), day_min_elev_deg=elev), model=model)
+        config = cfg.model_dump(mode="json") | {
+            "panel_path": str(panel), "panel_sha256": hashlib.sha256(panel.read_bytes()).hexdigest(),
+            "composition_sha256": sha, "competition": CompetitionSpec().model_dump(mode="json"),
+        }
+        recs.append(ExperimentRecord(run_id=run_id, created_at=datetime(2026, 1, 1, tzinfo=UTC), hypothesis="h", config=config,
+                                     git_commit=None, seeds=(0,), folds=("A",), metrics={"A/0": {"W": 1.0}},
+                                     comparison={"bag": {"A": {"W_all": 5.0, "W_warm": 2.0}}}))
+    return recs
+
+
+def _patch_edge_submit(monkeypatch: pytest.MonkeyPatch, recs: list[object], seen: dict[str, object]) -> list[tuple[object, ...]]:
+    import src.oibc.data.ecmwf_substitute as sub_mod
+    from src.oibc.evaluate import registry as registry_mod
+    from src.oibc.submit import build as build_mod
+
+    monkeypatch.setattr(registry_mod, "read_records", lambda *a, **k: recs)
+    monkeypatch.setattr(pd, "read_parquet", lambda *a, **k: pd.DataFrame({"site_id": ["s"], "current_group": ["A"]}))
+    monkeypatch.setattr(runner_mod, "resolve_composition", lambda *a, **k: (pd.DataFrame({"site_id": ["s"], "group": ["G1"]}), "abc"))
+    monkeypatch.setattr("src.oibc.pipeline._check_input_breaks", lambda *a, **k: [])
+    monkeypatch.setattr(sub_mod, "build_substituted_panel", lambda src, out, *a: Path(f"{src}.sub"))
+    base_fc = pd.DataFrame({"group": ["G1"], "ts": [pd.Timestamp("2025-06-01 06:00", tz="Asia/Seoul")], "forecast_kwh": [1.0]})
+    monkeypatch.setattr(runner_mod, "forecast_eval", lambda cfg, **k: base_fc)
+
+    def edge_fill(base, edge_cfg, *, base_min_elev_deg, panel_path, spec):
+        seen.update(edge_run=edge_cfg.run_id, base_min=base_min_elev_deg, edge_panel=panel_path)
+        return base.assign(forecast_kwh=base["forecast_kwh"] + 0.5)
+
+    monkeypatch.setattr(runner_mod, "edge_fill_forecast", edge_fill)
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(build_mod, "write_submission", lambda *a, **k: calls.append((a, k)))
+    return calls
+
+
+def test_submit_edge_fill_uses_edge_run_on_substituted_panel(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen: dict[str, object] = {}
+    calls = _patch_edge_submit(monkeypatch, _edge_records(tmp_path), seen)
+    assert main(["submit", "--run-id", "base", "--sub-id", "s1", "--ecmwf-substitute", "--edge-run-id", "edge"]) == 0
+    assert seen == {"edge_run": "edge", "base_min": 0.0, "edge_panel": Path(f"{tmp_path / 'edge.parquet'}.sub")}
+    forecast = calls[0][0][1]
+    assert forecast["forecast_kwh"].tolist() == [1.5]
+    assert "edge-fill run=edge elev=(-5,0]" in calls[0][1]["note"]
+
+
+@pytest.mark.parametrize("defect", ["composition", "model", "calibration"])
+def test_submit_edge_fill_guards(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, defect: str) -> None:
+    from src.oibc.config import ModelConfig
+
+    recs = _edge_records(
+        tmp_path,
+        edge_comp_sha="other" if defect == "composition" else "abc",
+        edge_model=ModelConfig(seeds=(0,), weight="none", n_rounds=7) if defect == "model" else None,
+    )
+    _patch_edge_submit(monkeypatch, recs, {})
+    argv = ["submit", "--run-id", "base", "--sub-id", "s1", "--edge-run-id", "edge"]
+    if defect == "calibration":
+        argv.append("--calibration")
+    match = {"composition": "composition", "model": "model config", "calibration": "calibration"}[defect]
+    with pytest.raises(runner_mod.RunnerError, match=match):
+        main(argv)

@@ -257,6 +257,7 @@ class EcmwfConfig(BaseModel):
     aifs_weight_00z: float = Field(default=0.5, ge=0.0, le=1.0)  # HRES 00z가 있는 블록의 AIFS 비중
     aifs_split_by_hres: bool = False  # 한 AIFS 창을 공유하는 블록을 HRES 블록 모양으로 나눈다(e85 A6)
     substitute_lambda: float = Field(default=0.5, gt=0.0, le=1.0)  # 입력 대체 G → G + λ(E - G), 결과 전 고정(e87)
+    substitute_aifs_weight_00z: float = Field(default=1.0, ge=0.0, le=1.0)  # 입력 대체에서 HRES 00z가 있는 블록의 AIFS 비중(SA D2, LB sub23)
 
     @model_validator(mode="after")
     def _check_aifs(self) -> EcmwfConfig:

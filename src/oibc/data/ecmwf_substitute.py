@@ -51,7 +51,7 @@ def gfs_references(gfs_hourly: pd.DataFrame, features: FeatureConfig, cfg: Ecmwf
 def substitution_targets(
     ec: pd.DataFrame, aifs: pd.DataFrame, gfs_win: pd.DataFrame, gfs_blk: pd.DataFrame, cfg: EcmwfConfig
 ) -> pd.DataFrame:
-    """블록별 목표 일사 E(e_in, e_box). HRES 00z와 AIFS가 함께 있으면 평균, AIFS만 있으면 AIFS, 없으면 HRES.
+    """블록별 목표 일사 E(e_in, e_box). HRES 00z와 AIFS가 함께 있으면 substitute_aifs_weight_00z 비중 결합, AIFS만 있으면 AIFS, 없으면 HRES.
 
     AIFS 6시간 창은 해 없는 시간이 섞일 수 있어 창을 공유하지 않는 블록은 같은 창 GFS와의 비율로 바꾸고,
     창을 공유하는 블록은 그날 HRES 블록 비율로 나눈다(A6). 반환 열: op, blk, e_in, e_box.
@@ -77,7 +77,8 @@ def substitution_targets(
         a = t[f"a_{s}"].copy()
         a[split] = t.loc[split, f"a_{s}"] * t.loc[split, f"ec_{s}"] / hm[split]
         has_a = a.notna()
-        t[f"e_{s}"] = np.where(has_a & is00, (t[f"ec_{s}"] + a) / 2, np.where(has_a, a, t[f"ec_{s}"]))
+        w = cfg.substitute_aifs_weight_00z
+        t[f"e_{s}"] = np.where(has_a & is00, (1.0 - w) * t[f"ec_{s}"] + w * a, np.where(has_a, a, t[f"ec_{s}"]))
     out = t[["op", "blk", "e_in", "e_box"]].dropna(subset=["e_in", "e_box"], how="all").reset_index(drop=True)
     out["blk"] = out["blk"].astype("int64")
     return out

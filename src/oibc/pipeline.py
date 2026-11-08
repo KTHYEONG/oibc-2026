@@ -284,7 +284,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 cfg.features,
                 spec,
             )
-            sub_note = f"ecmwf-substitute lambda={ec_cfg.substitute_lambda!r} (평가 기간 GFS sw 입력, 학습 행 불변)"
+            sub_note = (
+                f"ecmwf-substitute lambda={ec_cfg.substitute_lambda!r} aifs_w00={ec_cfg.substitute_aifs_weight_00z!r}"
+                " (평가 기간 GFS sw 입력, 학습 행 불변)"
+            )
             note = "; ".join(part for part in (note, sub_note) if part)
         forecast = forecast_eval(cfg, panel_path=panel_path, spec=spec, calibration=cal, calibration_cfg=cal_cfg)
         if args.edge_run_id is not None:

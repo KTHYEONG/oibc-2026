@@ -40,8 +40,13 @@ def test_substitution_targets_combines_hres_aifs_with_edge_ratio_and_split() -> 
     out = substitution_targets(ec, aifs, win, blk, CFG).set_index(["op", "blk"])["e_in"]
     # 18z 날: 블록0 = 120·50/50 = 120, 블록1·2 = 600·(200|400)/300, 블록3은 창 GFS ≤ 1이라 AIFS 없음 → HRES 100
     np.testing.assert_allclose(out.loc[d0].to_numpy(), [120.0, 400.0, 800.0, 100.0])
-    # 00z 날: HRES와 AIFS 평균, 블록3은 HRES
-    np.testing.assert_allclose(out.loc[d1].to_numpy(), [110.0, 300.0, 600.0, 100.0])
+    # 00z 날 기본(AIFS 비중 1): AIFS 단독, 블록3은 HRES
+    np.testing.assert_allclose(out.loc[d1].to_numpy(), [120.0, 400.0, 800.0, 100.0])
+    # AIFS 비중 0.5: HRES와 AIFS 평균
+    half = CFG.model_copy(update={"substitute_aifs_weight_00z": 0.5})
+    out_half = substitution_targets(ec, aifs, win, blk, half).set_index(["op", "blk"])["e_in"]
+    np.testing.assert_allclose(out_half.loc[d1].to_numpy(), [110.0, 300.0, 600.0, 100.0])
+    np.testing.assert_allclose(out_half.loc[d0].to_numpy(), out.loc[d0].to_numpy())
 
 
 def test_substitute_moves_block_mean_after_start_only_and_rebuilds_derived() -> None:
